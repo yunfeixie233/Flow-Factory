@@ -32,7 +32,12 @@ from .abc import ArgABC
 from .data_args import DataArguments
 from .model_args import ModelArguments
 from .scheduler_args import SchedulerArguments
-from .training_args import TrainingArguments, EvaluationArguments, get_training_args_class
+from .training_args import (
+    DiffusionOPDTrainingArguments,
+    EvaluationArguments,
+    TrainingArguments,
+    get_training_args_class,
+)
 from .reward_args import RewardArguments, MultiRewardArguments
 from .log_args import LogArguments
 from ..utils.logger_utils import setup_logger
@@ -155,6 +160,11 @@ class Arguments(ArgABC):
         # gate. Trivially deterministic on every rank because IDs come
         # from the same shared config.
         self._resolve_reward_dataset_ids()
+        # DiffusionOPD teacher routing (no-op for other trainers): each teacher's
+        # `applicable_datasets` must reference declared training datasets. The
+        # one-teacher-per-dataset rule is enforced in DiffusionOPDTrainer, not here
+        # (the config schema stays permissive for a future multi-teacher trainer).
+        self._validate_teacher_sources()
         self._resolve_scheduler_sde_defaults()
         self._resolve_sampler_type()
         self._align_batch_geometry()
@@ -315,6 +325,59 @@ class Arguments(ArgABC):
 
         _check_side(self.reward_args, train_names, side="Training")
         _check_side(self.eval_reward_args, eval_names, side="Eval")
+
+    def _validate_teacher_sources(self) -> None:
+        """Validate DiffusionOPD teacher routing (OPD trainer only).
+
+        Every ``TeacherConfig.applicable_datasets`` entry must reference a
+        declared training dataset (``data.datasets[*].name`` with training
+        enabled). The schema deliberately permits several teachers to share a
+        dataset; the one-teacher-per-dataset constraint is enforced by
+        ``DiffusionOPDTrainer`` (not here), so a future multi-teacher/ensemble
+        trainer can reuse this config unchanged.
+
+        Gated on ``isinstance(DiffusionOPDTrainingArguments)`` so it is a no-op
+        for non-OPD trainers. (A plain ``getattr(ta, "teachers", ...)`` would be
+        unsafe: ``ArgABC.__getattr__`` falls back to ``extra_kwargs``, so a stray
+        ``teachers:`` key in a non-OPD YAML would be picked up here and raise a
+        confusing error.)
+        """
+        ta = self.training_args
+        if not isinstance(ta, DiffusionOPDTrainingArguments):
+            return
+        teachers = ta.teachers
+        if not teachers:
+            return
+
+        train_names = {d.name for d in self.data_args.training_datasets}
+        if not train_names:
+            raise ValueError(
+                "DiffusionOPD requires `data.datasets` with at least one training dataset, "
+                "but none were found. Declare each teacher's dataset under `data.datasets`."
+            )
+
+        for i, teacher in enumerate(teachers):
+            unknown = [d for d in teacher.applicable_datasets if d not in train_names]
+            if unknown:
+                raise ValueError(
+                    f"DiffusionOPD teacher[{i}] (name={teacher.name!r}, path={teacher.path!r}) references "
+                    f"dataset(s) {unknown} not in training datasets {sorted(train_names)}. "
+                    "Each `applicable_datasets` entry must match a `data.datasets[*].name` whose `train` is enabled."
+                )
+
+        # Reverse check: every active training dataset must be claimed by at
+        # least one teacher (mirrors `_validate_every_source_has_a_reward`).
+        # The one-teacher-per-dataset (no-overlap) rule stays in
+        # DiffusionOPDTrainer; here we only require full coverage so an
+        # uncovered dataset fails at config parse, not mid-rollout.
+        covered = {ds for t in teachers for ds in t.applicable_datasets}
+        uncovered = sorted(train_names - covered)
+        if uncovered:
+            raise ValueError(
+                f"DiffusionOPD training dataset(s) {uncovered} are not distilled by any teacher. "
+                f"Each `data.datasets[*].name` with `train.enabled` must appear in exactly one "
+                f"teacher's `applicable_datasets`. Declared teachers cover: {sorted(covered)}."
+            )
 
     def _validate_dataset_routing(self) -> None:
         """Validate the unified ``data.datasets`` schema and reward routing.
