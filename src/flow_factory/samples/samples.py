@@ -34,6 +34,7 @@ from ..utils.base import (
 
 from diffusers.utils.import_utils import is_torch_available, is_torch_version
 
+from ..utils.base import map_tensor_leaves
 from ..utils.base import (
     ImageSingle,
     ImageBatch,
@@ -266,21 +267,54 @@ class BaseSample:
 
         return {k: tensor_to_repr(v) for k, v in self.to_dict().items()}
 
-    def to(self, device: Union[torch.device, str], depth : int = 1) -> BaseSample:
-        """Move all tensor fields to specified device."""
+    def to(
+        self,
+        device: Union[torch.device, str],
+        depth: int = 1,
+        non_blocking: bool = False,
+        pin_memory: bool = False,
+    ) -> BaseSample:
+        """Move all tensor fields to ``device`` (in place).
+
+        Args:
+            device: Target device.
+            depth: 0 moves only direct tensor fields; 1 also moves tensor-list fields.
+            non_blocking: Forwarded to ``Tensor.to``. Enables truly asynchronous
+                H2D when the host source is pinned (used by the copy-stream prefetch
+                in the optimize loop).
+            pin_memory: When moving to CPU, return page-locked (pinned) tensors so a
+                subsequent H2D copy can be issued asynchronously. Ignored for
+                non-CPU targets. Implies a blocking D2H (the copy must finish before
+                the pinned buffer is filled).
+        """
         assert 0 <= depth <= 1, "Only depth 0 and 1 are supported."
         device = torch.device(device)
+        pin = pin_memory and device.type == "cpu"
+
+        def _move(t: torch.Tensor) -> torch.Tensor:
+            if pin:
+                # One D2H straight into pinned memory, avoiding the
+                # pageable->pinned double copy of t.to("cpu").pin_memory().
+                out = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+                return out.copy_(t, non_blocking=non_blocking)
+            return t.to(device, non_blocking=non_blocking)
+
         for field in fields(self):
             value = getattr(self, field.name)
             if isinstance(value, torch.Tensor):
-                setattr(self, field.name, value.to(device))
+                setattr(self, field.name, _move(value))
             elif depth == 1 and is_tensor_list(value):
                 setattr(
                     self,
                     field.name,
-                    [t.to(device) if isinstance(t, torch.Tensor) else t for t in value]
+                    [_move(t) if isinstance(t, torch.Tensor) else t for t in value]
                 )
-            
+            elif depth == 1 and isinstance(value, dict):
+                # Move tensors nested in ANY dict field (in practice only
+                # extra_kwargs: advantage, mu_teacher, ...) so they follow the
+                # sample across offload/prefetch. Non-tensor leaves pass through.
+                setattr(self, field.name, map_tensor_leaves(value, _move))
+
         return self
 
     def _hash_id_fields(self, hasher: hashlib._Hash) -> None:
@@ -380,22 +414,25 @@ class BaseSample:
 
     @classmethod
     def stack(cls, samples: List[BaseSample]) -> Dict[str, Union[torch.Tensor, Dict, List, Any]]:
-        """
-        Stack BaseSample instances into batched structures.
-        
-        Field behavior controlled by class methods:
-            - shared_fields(): Take first element only (shared across batch)
-            - stackable_fields(): Stack tensors/dicts with matching structure
-            - Other: Collect into lists
-        
+        """Stack per-sample BaseSamples into one batched dict.
+
+        Returns a flat ``Dict[str, Any]`` (NOT a BaseSample) -- the batch
+        interchange format between the per-sample lifecycle (``List[BaseSample]``)
+        and ``adapter.forward(**batched_kwargs)``. Each sample is flattened via
+        ``to_dict()`` (which lifts ``extra_kwargs`` keys to the top level), then
+        ``_stack_values`` collates per key:
+            - ``shared_fields()`` keys: take the first sample's value (not stacked).
+            - tensors with matching shapes: ``torch.stack``; mismatched: list.
+            - dicts: collated recursively; other types (str, Set, PIL): list.
+
         Args:
-            samples: List of BaseSample instances
-        
+            samples: Non-empty list of BaseSample instances (each without a batch dim).
+
         Returns:
-            Dictionary with processed values per field
-        
+            Dict[str, Any]: batched values keyed by field / extra_kwargs name.
+
         Raises:
-            ValueError: If samples list is empty
+            ValueError: If samples list is empty.
         """
         if not samples:
             raise ValueError("No samples to stack.")

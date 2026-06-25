@@ -16,7 +16,7 @@
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal
+from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterator
 from functools import partial
 import numpy as np
 import torch
@@ -43,9 +43,19 @@ from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample
 from ..utils.logger_utils import setup_logger
-from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default
+from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default, visit_tensor_leaves
 
 logger = setup_logger(__name__)
+
+
+def _record_stream_on_batch(value: Any, stream: "torch.cuda.Stream") -> None:
+    """Record ``stream`` on every CUDA tensor in a stacked batch.
+
+    Required for the copy-stream prefetch: it stops the caching allocator from
+    reusing copy-stream-produced tensors until the consuming stream is done.
+    """
+    visit_tensor_leaves(value, lambda t: t.record_stream(stream) if t.is_cuda else None)
+
 
 class BaseTrainer(ABC):
     """
@@ -463,29 +473,97 @@ class BaseTrainer(ABC):
         return [samples[i] for i in perm]
 
     def _maybe_offload_samples_to_cpu(self, samples: List[BaseSample]) -> None:
-        """Move every sample's tensor fields to CPU when ``offload_samples_to_cpu`` is enabled.
+        """Offload each sample's tensors to pinned CPU when offload is enabled.
 
-        Producer-side half of the CPU-offload + lazy-reload pipeline: samples
-        leave ``sample()`` already on CPU so that the GPU peak from the rollout
-        buffer is bounded by a single batch worth of inference activations.
-
-        Must be called BEFORE ``self.reward_buffer.add_samples(...)`` so that
-        the buffer's recorded ``sync_event`` captures "D2H complete + data
-        ready on CPU"; downstream reward workers (sync or async) then see a
-        deterministic CPU-resident state and trigger their own H2D inside
-        ``RewardProcessor`` (see ``move_tensors_to_device`` in
-        ``utils/base.py``).
-
-        No-op when ``training_args.offload_samples_to_cpu`` is False
-        (default), preserving the legacy GPU-resident behaviour.
-
-        Args:
-            samples: Newly generated samples for the current sample loop iteration.
+        Producer half of the CPU-offload pipeline; keeps the rollout buffer's GPU
+        peak bounded. Must run BEFORE ``reward_buffer.add_samples`` so the recorded
+        ``sync_event`` captures "D2H complete + data on CPU" for async reward
+        workers. Uses pinned CPU + blocking D2H so the later per-micro-batch H2D
+        reload (``_iter_prefetched_batches``) can be issued asynchronously. No-op
+        when ``training_args.offload_samples_to_cpu`` is False (default).
         """
         if not self.training_args.offload_samples_to_cpu:
             return
         for sample in samples:
-            sample.to('cpu')
+            sample.to('cpu', pin_memory=True)
+
+    def _iter_prefetched_sample_batches(
+        self,
+        samples: List[BaseSample],
+        per_device_batch_size: int,
+    ) -> Iterator[Tuple[Dict[str, Any], List[BaseSample]]]:
+        """Yield ``(stacked_batch, device_resident_samples)`` for the optimize loop.
+
+        Same prefetch contract as :meth:`_iter_prefetched_batches`, but also hands
+        back the moved per-sample list so callers that need per-sample access
+        (teacher routing, ``mu_teacher`` write-back, group bookkeeping) get it
+        without a second move or a redundant side index.
+
+        When samples are CPU-offloaded (pinned), the next micro-batch's H2D copy
+        runs on a dedicated copy stream to overlap the current batch's compute;
+        ``wait_stream`` ensures the batch is fully copied before use and
+        ``record_stream`` keeps it alive until the default stream is done.
+        Otherwise (offload off, no CUDA, or a single batch) it is a plain blocking
+        stack. Numerically equivalent either way; only data-movement timing changes.
+
+        Yields:
+            (Dict[str, Any], List[BaseSample]): the stacked micro-batch and the
+            device-resident samples it was stacked from.
+        """
+        device = self.accelerator.device
+        starts = list(range(0, len(samples), per_device_batch_size))
+
+        use_prefetch = (
+            torch.cuda.is_available()
+            and self.training_args.offload_samples_to_cpu
+            and len(starts) > 1
+        )
+        if not use_prefetch:
+            for start in starts:
+                batch_samples = [
+                    sample.to(device)
+                    for sample in samples[start:start + per_device_batch_size]
+                ]
+                yield BaseSample.stack(batch_samples), batch_samples
+            return
+
+        copy_stream = torch.cuda.Stream(device)
+        compute_stream = torch.cuda.current_stream(device)
+
+        def _load(start: int) -> Tuple[Dict[str, Any], List[BaseSample]]:
+            with torch.cuda.stream(copy_stream):
+                moved = [
+                    sample.to(device, non_blocking=True)
+                    for sample in samples[start:start + per_device_batch_size]
+                ]
+                return BaseSample.stack(moved), moved
+
+        next_pair = _load(starts[0])
+        for i, _ in enumerate(starts):
+            batch, batch_samples = next_pair
+            compute_stream.wait_stream(copy_stream)  # batch H2D complete before use
+            _record_stream_on_batch(batch, compute_stream)  # keep alive for compute stream
+            if i + 1 < len(starts):
+                next_pair = _load(starts[i + 1])  # prefetch next, overlaps compute
+            yield batch, batch_samples
+
+    def _iter_prefetched_batches(
+        self,
+        samples: List[BaseSample],
+        per_device_batch_size: int,
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield device-resident stacked micro-batch dicts for the optimize loop.
+
+        Thin wrapper over :meth:`_iter_prefetched_sample_batches` for callers that
+        only need the stacked dict (see there for the prefetch/offload contract).
+
+        Yields:
+            Dict[str, Any]: a stacked micro-batch (see ``BaseSample.stack``).
+        """
+        for batch, _ in self._iter_prefetched_sample_batches(
+            samples, per_device_batch_size
+        ):
+            yield batch
 
     def sample_batch(
         self,

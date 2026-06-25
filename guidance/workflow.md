@@ -407,7 +407,6 @@ def optimize(self, samples):
 - **KL regularization**: Optional penalty keeping the policy close to a reference model (or EMA model for AWM), preventing reward hacking.
 - **Per-timestep iteration**: GRPO iterates over each stored trajectory timestep, computing loss at each. NFT, AWM, DGPO, and CRD sample fresh timesteps independently of the sampling trajectory.
 
-
 ## Putting It All Together
 
 A complete epoch with GRPO on a 8×GPU cluster:

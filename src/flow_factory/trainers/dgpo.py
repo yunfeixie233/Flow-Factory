@@ -748,6 +748,7 @@ class DGPOTrainer(BaseTrainer):
         sequence on every rank).
         """
         training_batches: List[Dict[str, Any]] = []
+        device = self.accelerator.device
         self.adapter.rollout()
 
         with torch.no_grad(), self.autocast():
@@ -757,7 +758,12 @@ class DGPOTrainer(BaseTrainer):
                 position=0,
                 disable=not self.show_progress_bar,
             ):
-                batch = BaseSample.stack(samples_slice)
+                # Blocking H2D reload (no-op when GPU-resident). This two-phase
+                # builder has no per-batch compute to overlap, so prefetch is N/A
+                # here; the prefetch dividend is realised inside the single-pass
+                # trainers' optimize loops, not this builder. DGPO samples are
+                # final-latent-only, so the H2D is tiny regardless.
+                batch = BaseSample.stack([s.to(device) for s in samples_slice])
                 all_latents: torch.Tensor = batch["all_latents"]  # type: ignore[assignment]
                 clean_latents = all_latents[:, -1]
                 batch_size = clean_latents.shape[0]

@@ -27,10 +27,12 @@ from PIL import Image
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from accelerate import Accelerator
+import diffusers
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
 from diffusers.utils.torch_utils import randn_tensor
 
 from ..abc import BaseAdapter
+from ._utils import _pad_seq_dim
 from ...samples import I2ISample
 from ...hparams import *
 from ...scheduler import (
@@ -41,6 +43,7 @@ from ...scheduler import (
 )
 from ...utils.logger_utils import setup_logger
 from ...utils.base import filter_kwargs
+from ...utils.imports import is_version_at_least
 from ...utils.image import (
     ImageSingle,
     ImageBatch,
@@ -98,8 +101,20 @@ def calculate_dimensions(target_area, ratio):
 
 class QwenImageEditPlusAdapter(BaseAdapter):
     """Adapter for Qwen-Image-Edit Plus text-to-image models."""
-    
+
+    # Qwen-Image-Edit Plus runs with guidance=None, so the transformer's guidance
+    # embedder receives no gradient and DDP must scan for unused parameters.
+    ddp_find_unused_parameters = True
+
     def __init__(self, config: Arguments, accelerator : Accelerator):
+        if not is_version_at_least("diffusers", "0.37.0"):
+            raise ImportError(
+                "QwenImageEditPlusAdapter requires diffusers>=0.37.0 (the "
+                "transformer derives the text sequence length from "
+                "encoder_hidden_states_mask; txt_seq_lens is no longer passed). "
+                f"Found diffusers {diffusers.__version__}. "
+                "Upgrade with `pip install -U 'diffusers>=0.37.0'`."
+            )
         super().__init__(config, accelerator)
         self.pipeline: QwenImageEditPlusPipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
@@ -565,15 +580,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         prompt_embeds: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         prompt_ids: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         device : Optional[torch.device] = None,
-    ) -> Tuple[List[int], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         if isinstance(prompt_embeds_mask, list):
             device = device or prompt_embeds_mask[0].device
-            txt_seq_lens = [mask.sum() for mask in prompt_embeds_mask]
+            max_pos_len = max(1, int(max(mask.sum() for mask in prompt_embeds_mask)))
         else:
             device = device or prompt_embeds_mask.device
-            txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
+            max_pos_len = max(1, int(prompt_embeds_mask.sum(dim=1).max()))
 
-        max_pos_len = max(txt_seq_lens)
         if prompt_ids is not None:
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             padded_prompt_ids = self._standardize_data(
@@ -601,13 +615,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             device=device,
             max_len=max_pos_len,
         )
-        # Make the output order the args order
-        return (
-            txt_seq_lens,
-            padded_prompt_embeds_mask,
-            padded_prompt_embeds,
-            padded_prompt_ids,
-        )
+        return padded_prompt_embeds_mask, padded_prompt_embeds, padded_prompt_ids
     
     # ======================== Sampling / Inference ========================
     # Handle one sample
@@ -1021,23 +1029,21 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         do_classifier_free_guidance = guidance_scale > 1.0 and has_negative_prompt
         guidance = None  # Always None for Qwen-Image-Edit Plus
 
-        # Prepare txt_seq_lens and negative_txt_seq_lens, which will be deprecated in `diffuers==0.39.0`,
-        # to update, just modify the following lines accordingly.
-        # Truncate prompt embeddings and masks to max valid lengths in the batch
-        txt_seq_lens, prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
+        # Truncate prompt embeddings and masks to the max valid length in the
+        # batch. diffusers (>=0.38) derives the per-sample text length from
+        # encoder_hidden_states_mask, so the deprecated txt_seq_lens is not passed.
+        prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
             prompt_embeds_mask=prompt_embeds_mask,
             prompt_embeds=prompt_embeds,
             device=device
         )
 
         if do_classifier_free_guidance:
-            negative_txt_seq_lens, negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
+            negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 prompt_embeds=negative_prompt_embeds,
                 device=device
             )
-        else:
-            negative_txt_seq_lens = None
 
         # Prepare model input (concatenate condition latents for I2I)
         latent_model_input = latents
@@ -1045,44 +1051,60 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             latent_model_input = torch.cat([latents, image_latents], dim=1)
 
         # 2. Transformer forward pass
-        # Conditional forward pass
-        with self.pipeline.transformer.cache_context("cond"):
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep / 1000,
+        if do_classifier_free_guidance:
+            # Merge cond/uncond into one batched forward (halves transformer
+            # calls). cond/uncond share latent_model_input (image latents are
+            # CFG-invariant); pad both text streams to a common length and mask
+            # via encoder_hidden_states_mask (diffusers derives each sample's
+            # length from it). Output is sliced to the generated-latent tokens as
+            # before. RL has no cross-step caching, so dropping the per-branch
+            # cache_context is a no-op. Tradeoff: ~2x peak activation memory vs
+            # two serial forwards (lower batch/resolution if it OOMs).
+            seq_len = max(prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
+            prompt_embeds = _pad_seq_dim(prompt_embeds, seq_len, 0.0)
+            prompt_embeds_mask = _pad_seq_dim(prompt_embeds_mask, seq_len, 0)
+            negative_prompt_embeds = _pad_seq_dim(negative_prompt_embeds, seq_len, 0.0)
+            negative_prompt_embeds_mask = _pad_seq_dim(
+                negative_prompt_embeds_mask, seq_len, 0
+            )
+
+            both_pred = self.transformer(
+                hidden_states=torch.cat([latent_model_input, latent_model_input], dim=0),
+                timestep=torch.cat([timestep, timestep], dim=0) / 1000,
                 guidance=guidance,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens, # No need after diffusers 0.37.0 and will be deprecated in 0.39.0
+                encoder_hidden_states_mask=torch.cat(
+                    [prompt_embeds_mask, negative_prompt_embeds_mask], dim=0
+                ),
+                encoder_hidden_states=torch.cat(
+                    [prompt_embeds, negative_prompt_embeds], dim=0
+                ),
+                img_shapes=img_shapes * 2,
                 attention_kwargs=attention_kwargs,
                 return_dict=False,
             )[0]
+            both_pred = both_pred[:, :latents.size(1)]
+            noise_pred, neg_noise_pred = both_pred.chunk(2, dim=0)
 
-        noise_pred = noise_pred[:, :latents.size(1)]
-
-        # CFG: unconditional forward pass
-        if do_classifier_free_guidance:
-            with self.pipeline.transformer.cache_context("uncond"):
-                neg_noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens, # No need after diffusers 0.37.0 and will be deprecated in 0.39.0
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
-
-            neg_noise_pred = neg_noise_pred[:, :latents.size(1)]
             comb_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
 
             # Rescale norm (Qwen-Image-Edit Plus specific)
             cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
             noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
             noise_pred = comb_pred * (cond_norm / noise_norm)
+        else:
+            # Single conditional forward pass (no CFG).
+            with self.pipeline.transformer.cache_context("cond"):
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep / 1000,
+                    guidance=guidance,
+                    encoder_hidden_states_mask=prompt_embeds_mask,
+                    encoder_hidden_states=prompt_embeds,
+                    img_shapes=img_shapes,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )[0]
+            noise_pred = noise_pred[:, :latents.size(1)]
 
         # 3. Scheduler step
         output = self.scheduler.step(
