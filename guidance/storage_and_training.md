@@ -258,6 +258,39 @@ the maintained wrapper is:
 ./scripts/train_nft_pickapic_multi_reward.sh
 ```
 
+### Privileged-prompt distillation (PPD) arms
+
+The PPD arms (see the PPD section of
+[`algorithms.md`](algorithms.md)) add one storage input on top of a prepared
+runtime: a row-keyed privileged-prompt records file per baseline. Records are
+staged by a dedicated idempotent step that runs **after** the preparer,
+because the stock-GenEval records are derived from the staged repository's
+`dataset/geneval/train.jsonl` and both files must live on local SSD before a
+launcher may start:
+
+```bash
+# After prepare + check. Rerun after any preparer rerun (staging is cheap).
+./scripts/prepare_ppd_records.sh
+
+# Auxiliary arms (CONFIG=... selects the matched rho=0 control instead).
+./scripts/train_nft_geneval_stock_ppd.sh
+./scripts/train_nft_pickapic_multi_reward_ppd.sh
+```
+
+The staged records land under `data/geneval_stock_ppd_pairs/` (built by
+`scripts/build_geneval_stock_ppd_records.py` with a SHA-256 manifest; 100%
+prompt coverage, 37.99% changed rows) and `data/pickapic_balanced_v0_pairs/`
+(the legacy balanced_v0 pairs normalized to PPD schema v1; 87.37% changed
+rows). Both are tens of megabytes — negligible next to the Arrow caches. The
+PPD launchers fail fast when records are missing, and trainer initialization
+independently validates every record against the training prompts.
+
+PPD adds no new durable outputs: checkpoints, logs, and W&B artifacts follow
+the same local-SSD-then-publish contract as the baselines. The matched-arm
+discipline is operational, not just statistical — run the `rho: 0.0` control
+with the same seed and confirm `ppd/control_zero == 0` at every step before
+trusting an auxiliary/control comparison.
+
 Its config is
 [`pickapic_multi_reward.yaml`](../examples/nft/lora/sd3_5/pickapic_multi_reward.yaml).
 It uses the original 25,432/2,048-prompt AdvantageFlow Pick-a-Pic split, SD3.5
@@ -508,6 +541,9 @@ Before launch:
 - [ ] MMCV CUDA validation passed on the current GPU architecture.
 - [ ] The selected YAML points its dataset, Arrow cache, and save directory to
       local SSD.
+- [ ] For PPD arms: `scripts/prepare_ppd_records.sh` has run after the latest
+      preparer invocation, and the matched `rho: 0.0` control is scheduled
+      alongside the auxiliary arm.
 - [ ] `CHECKPOINT_S3_URI` is a unique, authorized run prefix for any run that
       must survive node loss.
 - [ ] A completed S3 checkpoint is not assumed resumable until the restore path
