@@ -46,7 +46,9 @@ set -Eeuo pipefail
 #
 #   Environment overrides (all optional):
 #     FLOWFACTORY_CHECKOUT  durable source checkout (default below; cloned if absent)
-#     WANDB_ENTITY          default i2r-ali (beside baseline 6nyi9wvw)
+#     WANDB_ENTITY          default vlaa-med (the historical baseline run
+#                           6nyi9wvw predates this default and sits under
+#                           the personal entity i2r-ali)
 #     WANDB_MODE            online|offline (caller value wins over .env)
 #     CHECKPOINT_S3_URI     s3://... run prefix; EMPTY means checkpoints are
 #                           local-only and DIE WITH THE NODE (retention 2).
@@ -74,7 +76,7 @@ set -Eeuo pipefail
 REPO_URL="${REPO_URL:-https://github.com/yunfeixie233/Flow-Factory.git}"
 FLOWFACTORY_CHECKOUT="${FLOWFACTORY_CHECKOUT:-/sensei-fs-3/users/yunfeix/origin_flowfactory/Flow-Factory}"
 PPD_ARM="${PPD_ARM:-aux}"
-export WANDB_ENTITY="${WANDB_ENTITY:-i2r-ali}"
+export WANDB_ENTITY="${WANDB_ENTITY:-vlaa-med}"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -109,7 +111,7 @@ fi
 printf '\n=============== Pick-a-Pic PPD experiment ===============\n'
 printf 'Arm:          %s\n' "${PPD_ARM}"
 printf 'Config:       %s\n' "${CONFIG}"
-printf 'W&B entity:   %s (baseline 6nyi9wvw lives in i2r-ali)\n' "${WANDB_ENTITY}"
+printf 'W&B entity:   %s\n' "${WANDB_ENTITY}"
 printf 'Reminder:     control must log ppd/control_zero == 0 every step\n'
 printf '=========================================================\n\n'
 exec ./scripts/train_nft_pickapic_multi_reward_ppd.sh
