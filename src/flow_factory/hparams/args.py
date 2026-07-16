@@ -32,6 +32,7 @@ from .abc import ArgABC
 from .data_args import DataArguments
 from .critique_args import CritiqueArguments
 from .model_args import ModelArguments
+from .ppd_args import PPDArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import (
     DiffusionOPDTrainingArguments,
@@ -162,11 +163,23 @@ class Arguments(ArgABC):
         default_factory=CritiqueArguments,
         metadata={"help": "Optional shared T2I critique/refinement configuration."},
     )
+    ppd_args: PPDArguments = field(
+        default_factory=PPDArguments,
+        metadata={"help": "Optional privileged-prompt distillation configuration."},
+    )
 
     def __post_init__(self):
         if self.log_args.run_name is None:
             time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
+
+        # Both components rewrite the same conditioning channel; a run must
+        # choose one privileged-prompt mechanism so effects stay attributable.
+        if self.critique_args.enabled and self.ppd_args.enabled:
+            raise ValueError(
+                "critique.enabled and ppd.enabled are mutually exclusive; "
+                "disable one of the two components"
+            )
 
         self._validate_dataset_routing()
         # Resolve `RewardArguments.applicable_datasets is None` -> concrete
@@ -1009,6 +1022,7 @@ class Arguments(ArgABC):
             'rewards': ('reward_args', MultiRewardArguments),
             'eval_rewards': ('eval_reward_args', MultiRewardArguments),
             'critique': ('critique_args', CritiqueArguments),
+            'ppd': ('ppd_args', PPDArguments),
         }
 
         # 3. Build init kwargs

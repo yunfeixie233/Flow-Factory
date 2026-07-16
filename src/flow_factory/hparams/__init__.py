@@ -17,6 +17,7 @@
 from .args import Arguments
 from .critique_args import CritiqueArguments
 from .data_args import DataArguments
+from .ppd_args import PPDArguments
 from .dataset_args import DatasetArguments, DatasetEvalSpec, DatasetTrainSpec
 from .log_args import LogArguments
 from .model_args import ModelArguments
@@ -42,6 +43,7 @@ __all__ = [
     "ModelArguments",
     "SchedulerArguments",
     "CritiqueArguments",
+    "PPDArguments",
     "TrainingArguments",
     "GRPOTrainingArguments",
     "DPPOTrainingArguments",

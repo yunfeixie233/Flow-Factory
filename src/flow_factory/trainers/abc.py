@@ -40,7 +40,7 @@ from ..data_utils.loader import (
 )
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
-from ..critique import CritiqueProcessor
+from ..critique import CritiqueProcessor, PPDProcessor
 from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample, StackedSampleBatch
 from ..utils.logger_utils import setup_logger
@@ -271,6 +271,12 @@ class BaseTrainer(ABC):
         self.critique_processor = (
             CritiqueProcessor(self.config.critique_args)
             if self.config.critique_args.enabled
+            else None
+        )
+        # Records-based privileged-prompt conditioning; also trainer-agnostic.
+        self.ppd_processor = (
+            PPDProcessor(self.config.ppd_args)
+            if self.config.ppd_args.enabled
             else None
         )
 

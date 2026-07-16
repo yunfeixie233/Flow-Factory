@@ -198,6 +198,10 @@ Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSampl
 
 `CritiqueProcessor` (`critique/processor.py`) is an optional algorithm-neutral service initialized by `BaseTrainer`. It owns the backend request/result contract, prompt recipes, semantic validation, temporary rewritten-prompt encoding, same-seed paired rollout, original-prompt round-2 reward, and group-normalized improvement advantage. It attaches a nested `sample.extra_kwargs["critique"]` pair; trainers explicitly opt into consuming it. DiffusionNFT is the first and currently only loss consumer.
 
+### Privileged-Prompt Distillation (PPD)
+
+`PPDProcessor` (`critique/ppd.py`) is the records-based sibling of the critique service: no API, no second rendering, no reward interaction. It joins each training sample to a precomputed privileged prompt by exact original-prompt text, encodes it, and attaches `sample.extra_kwargs["ppd"] = {active, conditioning}`. DiffusionNFT consumes it as `rho * active * sigma_t^2 * ||v_theta(x_t,c) - sg[v_old(x_t,c) + kappa (v_old(x_t,c') - v_old(x_t,c))]||^2` at its own training states, with the lagged EMA sampling policy as the teacher. `critique` and `ppd` are mutually exclusive per run; the matched control arm pins `rho: 0.0` and must log `ppd/control_zero == 0`.
+
 ### Configuration Hierarchy
 ```
 Arguments (top-level)
@@ -207,6 +211,7 @@ Arguments (top-level)
 ├── DataArguments         # dataset, preprocessing, resolution, sampler_type
 ├── MultiRewardArguments  # reward_model configs (list of RewardArguments)
 ├── CritiqueArguments     # optional shared T2I critique/refinement service
+├── PPDArguments          # optional privileged-prompt distillation records/loss
 ├── LogArguments          # logger type, verbose, project name
 └── EvaluationArguments   # evaluation settings
 ```

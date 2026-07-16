@@ -445,6 +445,37 @@ The built-in backend launches all API rows concurrently. Once the first rollout 
 
 For a complete runnable GenEval setup, see [`examples/nft/lora/sd3_5/geneval_critique.yaml`](../examples/nft/lora/sd3_5/geneval_critique.yaml).
 
+### Optional Privileged-Prompt Distillation (PPD)
+
+PPD is the records-based sibling of the critique component and is mutually exclusive with it. There is no API call, no second rendering, and no reward interaction: rollout generation and every reward stay conditioned on the **original** prompt, and a precomputed privileged prompt $c'$ (from `ppd.records_path`, joined to samples by exact original-prompt text) is visible to the loss only. This isolates transferred training signal from easier conditioning — the matched control arm (`rho: 0.0`) executes identical plumbing and its objective is exactly the native baseline.
+
+At each NFT training state $x_t$ the lagged EMA sampling policy $v_{\text{old}}$ (which DiffusionNFT already queries for its own loss) supplies a same-state CFG target, and the auxiliary rows are
+
+$$
+L_{\text{PPD}} = \rho\, m\, \sigma_t^2 \left\|v_\theta(x_t,c) - \operatorname{sg}\!\left[v_{\text{old}}(x_t,c) + \kappa\,(v_{\text{old}}(x_t,c') - v_{\text{old}}(x_t,c))\right]\right\|_2^2,
+$$
+
+where $m$ is the identity mask (rows whose privileged prompt equals the original are inactive) and $\kappa \in [0,1]$ interpolates the teacher target (`kappa: 1.0` distills the fully privileged-conditioned velocity). Only one extra no-grad teacher forward per timestep is added; the base teacher is the existing old-policy prediction. In the AdvantageFlow reference this distillation runs at stored reverse-process rollout states; the Flow-Factory adaptation applies it at DiffusionNFT's own re-noised training states, so the student and teacher always share the exact state the native loss is optimizing.
+
+```yaml
+ppd:
+  enabled: true
+  records_path: "${RUNTIME_ROOT}/data/geneval_stock_ppd_pairs/records.jsonl"
+  rho: 0.016         # 0.0 = matched control; GenEval calibration 0.016, Pick-a-Pic 0.006
+  kappa: 1.0
+  timestep_weighted: true   # multiply rows by sigma_t^2
+  mask_identity: true       # unchanged privileged prompts are inactive
+  require_records_coverage: true
+
+train:
+  trainer_type: nft
+  off_policy: true          # required: the EMA sampling policy is the teacher
+```
+
+**Correctness metrics.** `ppd/control_zero` must be exactly `0` on every step of a `rho: 0.0` control run (objective purity). `ppd/to_native_abs_loss` is the auxiliary/native loss-magnitude ratio used for `rho` calibration (the AdvantageFlow production ratio target is roughly 1%). `ppd/data_coverage_rate` and `ppd/data_active_rate` report records coverage and changed-row share; `ppd/teacher_delta_rms` and `ppd/target_displacement_rms` bound how far the privileged conditioning moves the teacher target. Records for the stock GenEval and Pick-a-Pic baselines are staged with `scripts/prepare_ppd_records.sh`.
+
+Runnable arms: [`geneval_stock_ppd.yaml`](../examples/nft/lora/sd3_5/geneval_stock_ppd.yaml) / [`geneval_stock_ppd_control.yaml`](../examples/nft/lora/sd3_5/geneval_stock_ppd_control.yaml) and [`pickapic_multi_reward_ppd.yaml`](../examples/nft/lora/sd3_5/pickapic_multi_reward_ppd.yaml) / [`pickapic_multi_reward_ppd_control.yaml`](../examples/nft/lora/sd3_5/pickapic_multi_reward_ppd_control.yaml).
+
 ## AWM: Advantage Weighted Matching
 
 This algorithm is introduced in [[10]](#ref10). **Advantage Weighted Matching** further aligns RL optimization with the flow-matching pretraining objective by weighting the standard velocity matching loss with per-sample advantages. This formulation incorporates reward-based guidance directly into the velocity matching loss, effectively aligning the optimization target with the original flow-matching objective.

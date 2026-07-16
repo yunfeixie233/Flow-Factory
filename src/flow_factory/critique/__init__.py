@@ -15,7 +15,8 @@
 """Standalone T2I critique/refinement component."""
 
 from .abc import BaseCritiqueBackend, CritiqueRequest, CritiqueResult
-from .loss import critique_direction_loss
+from .loss import critique_direction_loss, ppd_same_state_distillation_loss
+from .ppd import PPDProcessor, load_ppd_records
 from .processor import CritiqueProcessor
 from .registry import load_critique_backend
 from .validators import validate_geneval_rewrite
@@ -25,7 +26,10 @@ __all__ = [
     "CritiqueRequest",
     "CritiqueResult",
     "CritiqueProcessor",
+    "PPDProcessor",
     "critique_direction_loss",
     "load_critique_backend",
+    "load_ppd_records",
+    "ppd_same_state_distillation_loss",
     "validate_geneval_rewrite",
 ]

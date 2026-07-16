@@ -32,7 +32,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from ..critique import critique_direction_loss
+from ..critique import critique_direction_loss, ppd_same_state_distillation_loss
 from ..hparams import NFTTrainingArguments
 from ..rewards import RewardBuffer
 from ..samples import BaseSample
@@ -69,6 +69,29 @@ class DiffusionNFTTrainer(BaseTrainer):
         self.kl_type = self.training_args.kl_type
         self.critique_enabled = self.config.critique_args.enabled
         self._critique_rollout_batch_index = 0
+
+        # Privileged-prompt distillation (PPD). The privileged prompt is loss-only:
+        # rollouts and rewards stay on the original prompt, and the matched
+        # control arm executes this exact plumbing with rho=0.
+        self.ppd_enabled = self.config.ppd_args.enabled
+        self.ppd_rho = self.config.ppd_args.rho
+        self.ppd_kappa = self.config.ppd_args.kappa
+        self.ppd_timestep_weighted = self.config.ppd_args.timestep_weighted
+        if self.ppd_enabled:
+            if self.critique_enabled:
+                raise ValueError(
+                    "Privileged-prompt distillation cannot be combined with the critique component"
+                )
+            if not self.off_policy:
+                raise ValueError(
+                    "Privileged-prompt distillation requires off_policy=true: the lagged "
+                    "EMA sampling policy is the distillation teacher"
+                )
+            if float(self.training_args.guidance_scale) != 1.0:
+                raise ValueError(
+                    "Privileged-prompt distillation currently requires train.guidance_scale=1.0"
+                )
+
     @property
     def enable_kl_loss(self) -> bool:
         """Check if KL penalty is enabled."""
@@ -285,6 +308,10 @@ class DiffusionNFTTrainer(BaseTrainer):
                 adv_metrics.update(
                     self.critique_processor.refine(self, samples, rewards)
                 )
+        if self.ppd_enabled:
+            if self.ppd_processor is None:
+                raise RuntimeError("PPD is enabled but the shared processor was not initialized")
+            adv_metrics.update(self.ppd_processor.attach(self, samples))
         if adv_metrics:
             self.log_data(adv_metrics, step=self.step)
 
@@ -322,12 +349,29 @@ class DiffusionNFTTrainer(BaseTrainer):
                 critique_clean_latents = (
                     critique['clean_latents'] if critique is not None else None
                 )
+                ppd = batch.get('ppd') if self.ppd_enabled else None
+                if self.ppd_enabled and ppd is None:
+                    raise RuntimeError(
+                        "PPD is enabled but the batch carries no attached privileged "
+                        "conditioning; prepare_feedback must run before optimize"
+                    )
+                # The privileged conditioning replaces only the prompt embeddings;
+                # every other input (state, timestep, latents) is shared with the
+                # native forward passes.
+                ppd_conditioned_batch = (
+                    {**batch, **ppd['conditioning']} if ppd is not None else None
+                )
+
                 # ---------- Per-batch precompute: old v predictions under sampling policy ----------
                 self.adapter.rollout()
                 with torch.no_grad(), self.autocast(), self.sampling_context():
                     all_timesteps = self._sample_timesteps(batch_size)  # (T, B)
                     all_random_noise: List[torch.Tensor] = []
                     old_v_pred_list: List[torch.Tensor] = []
+                    # PPD teacher: the SAME lagged sampling policy evaluated at the
+                    # SAME noised state under the privileged conditioning. The base
+                    # teacher is old_v_pred itself, so only one extra forward runs.
+                    ppd_teacher_rewrite_list: List[torch.Tensor] = []
                     for t_idx in range(self.num_train_timesteps):
                         t_flat = all_timesteps[t_idx]  # (B,) scheduler scale [0, 1000]
                         sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
@@ -340,6 +384,13 @@ class DiffusionNFTTrainer(BaseTrainer):
                         noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
                         old_output = self._compute_nft_output(batch, t_flat, noised_latents)
                         old_v_pred_list.append(old_output['noise_pred'].detach())
+                        if ppd is not None:
+                            ppd_rewrite_output = self._compute_nft_output(
+                                ppd_conditioned_batch, t_flat, noised_latents
+                            )
+                            ppd_teacher_rewrite_list.append(
+                                ppd_rewrite_output['noise_pred'].detach()
+                            )
 
                 # ---------- Train this batch under current policy ----------
                 self.adapter.train()
@@ -430,6 +481,77 @@ class DiffusionNFTTrainer(BaseTrainer):
                                 direction_mse.mean().detach()
                             )
                             loss_info['critique_loss'].append(critique_loss.detach())
+
+                        # Optional privileged-prompt distillation. No reward gate and
+                        # no signed coefficient: rows are rho * active * sigma^2 * MSE
+                        # against the lagged same-state CFG target. The rho=0 control
+                        # executes all of this and must log ppd/control_zero == 0.
+                        if ppd is not None:
+                            ppd_active = ppd['active'].to(
+                                device=new_v_pred.device, dtype=torch.float32
+                            )
+                            ppd_teacher_rewrite = ppd_teacher_rewrite_list[t_idx]
+                            ppd_rows, ppd_mse = ppd_same_state_distillation_loss(
+                                student_velocity=new_v_pred,
+                                teacher_base_velocity=old_v_pred,
+                                teacher_rewrite_velocity=ppd_teacher_rewrite,
+                                kappa=self.ppd_kappa,
+                                active=ppd_active,
+                                sigma=(
+                                    flow_match_sigma(t_flat)
+                                    if self.ppd_timestep_weighted
+                                    else None
+                                ),
+                            )
+                            ppd_weighted_rows = self.ppd_rho * ppd_rows
+                            loss = loss + ppd_weighted_rows.mean()
+
+                            with torch.no_grad():
+                                reduce_dims = tuple(range(1, old_v_pred.ndim))
+                                teacher_delta = ppd_teacher_rewrite - old_v_pred
+                                teacher_base_rms = (
+                                    old_v_pred.float().square().mean(dim=reduce_dims).sqrt()
+                                )
+                                teacher_delta_rms = (
+                                    teacher_delta.float().square().mean(dim=reduce_dims).sqrt()
+                                )
+                                active_denominator = ppd_active.sum().clamp_min(1.0)
+                                active_delta_rms = (
+                                    ppd_active * teacher_delta_rms
+                                ).sum() / active_denominator
+                                native_rows = ori_policy_loss * adv_clip_range[1]
+                                loss_info['ppd/active_rate'].append(ppd_active.mean())
+                                loss_info['ppd/mse'].append(
+                                    (ppd_active * ppd_mse.detach()).sum() / active_denominator
+                                )
+                                loss_info['ppd/weighted_loss'].append(
+                                    ppd_weighted_rows.mean().detach()
+                                )
+                                # The matched rho=0 control deliberately executes all
+                                # PPD data/teacher/student plumbing. This metric must
+                                # remain exactly zero there; runs and tests use it as
+                                # an objective-purity check.
+                                loss_info['ppd/control_zero'].append(
+                                    ppd_weighted_rows.detach().abs().amax()
+                                    if self.ppd_rho == 0.0
+                                    else torch.zeros((), device=new_v_pred.device)
+                                )
+                                loss_info['ppd/to_native_abs_loss'].append(
+                                    ppd_weighted_rows.detach().abs().mean()
+                                    / (native_rows.detach().abs().mean() + 1e-12)
+                                )
+                                loss_info['ppd/teacher_delta_rms'].append(active_delta_rms)
+                                loss_info['ppd/teacher_delta_to_base_rms'].append(
+                                    (
+                                        ppd_active
+                                        * teacher_delta_rms
+                                        / teacher_base_rms.clamp_min(1e-12)
+                                    ).sum()
+                                    / active_denominator
+                                )
+                                loss_info['ppd/target_displacement_rms'].append(
+                                    self.ppd_kappa * active_delta_rms
+                                )
 
                         # 4. KL penalty
                         if self.enable_kl_loss:
