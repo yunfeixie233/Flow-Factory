@@ -461,7 +461,7 @@ where $m$ is the identity mask (rows whose privileged prompt equals the original
 ppd:
   enabled: true
   records_path: "${RUNTIME_ROOT}/data/geneval_stock_ppd_pairs/records.jsonl"
-  rho: 100.0         # 0.0 = matched control; see the calibration note below
+  rho: 0.056         # 0.0 = matched control; see the calibration note below
   kappa: 1.0
   timestep_weighted: true   # multiply rows by sigma_t^2
   mask_identity: true       # unchanged privileged prompts are inactive
@@ -472,7 +472,9 @@ train:
   off_policy: true          # required: the EMA sampling policy is the teacher
 ```
 
-**Calibrating `rho`.** The calibration metric is `ppd/to_native_abs_loss`, the auxiliary/native loss-magnitude ratio, targeted at roughly 1% (the AdvantageFlow production target; AF measured a gradient ratio, which does not port cleanly under ZeRO, so Flow-Factory uses the loss ratio as its proxy). Do **not** copy `rho` values across trainers: the ratio depends on the native loss scale, and DiffusionNFT's policy loss (`/nft_beta`, `* adv_clip`) is orders of magnitude larger than AF's flow-matching loss. Measured at production geometry (step-0 epoch): the stock-GenEval config (native ~24, `nft_beta=0.1`) reads 0.56% at `rho=60`, so the shipped `rho: 100.0` lands ~0.93%; the Pick-a-Pic three-reward config (native ~2.2, `nft_beta=1.0`) reads 0.85% at `rho=7`, so the shipped `rho: 8.0` lands ~0.97%. The ratio is linear in `rho`: run one short epoch, read `ppd/to_native_abs_loss`, and scale.
+**Calibrating `rho` — use the gradient ratio, never the loss ratio.** The calibration metric is `ppd/grad_ratio`, the auxiliary/native **gradient-norm** ratio over the trainable parameters, targeted at roughly 1% (the AdvantageFlow production value). The loss-magnitude ratio (`ppd/to_native_abs_loss`) is logged but **must not be used for calibration**: DiffusionNFT's normalized policy loss carries a large value with a comparatively small gradient, so the loss ratio understates the auxiliary pull by orders of magnitude. Empirically (2026-07-16): Pick-a-Pic at `rho=8` read a 1.0% loss ratio but a **389%** gradient ratio and its training reward collapsed within five epochs; stock GenEval at `rho=100` read 0.93% loss ratio but **1772%** gradient ratio.
+
+The probe (`ppd.log_gradient_ratio`, on by default) runs `torch.autograd.grad` on the first timestep of each optimize batch and warns above `ppd.gradient_ratio_warn` (5%). DeepSpeed's backward hooks are incompatible with the probe, so it disables itself under a `config_file` with ZeRO — **calibrate on plain DDP** (`config_file: null`, bf16, one epoch), read `ppd/grad_ratio`, and scale linearly. Measured at production geometry: stock GenEval `rho=100` → 17.72, so the shipped `rho: 0.056` lands ~0.99%; Pick-a-Pic `rho=8` → 3.89, so the shipped `rho: 0.02` lands ~0.97%. These corrected values sit inside AdvantageFlow's own `rho` range (0.016–0.052), as expected for a scale-invariant metric.
 
 **Correctness metrics.** `ppd/control_zero` must be exactly `0` on every step of a `rho: 0.0` control run (objective purity). `ppd/data_coverage_rate` and `ppd/data_active_rate` report records coverage and changed-row share; `ppd/teacher_delta_rms` and `ppd/target_displacement_rms` bound how far the privileged conditioning moves the teacher target. Records for the stock GenEval and Pick-a-Pic baselines are staged with `scripts/prepare_ppd_records.sh`.
 

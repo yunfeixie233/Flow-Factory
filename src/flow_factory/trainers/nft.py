@@ -32,7 +32,11 @@ from diffusers.utils.torch_utils import randn_tensor
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from ..critique import critique_direction_loss, ppd_same_state_distillation_loss
+from ..critique import (
+    critique_direction_loss,
+    gradient_norm_ratio,
+    ppd_same_state_distillation_loss,
+)
 from ..hparams import NFTTrainingArguments
 from ..rewards import RewardBuffer
 from ..samples import BaseSample
@@ -77,6 +81,23 @@ class DiffusionNFTTrainer(BaseTrainer):
         self.ppd_rho = self.config.ppd_args.rho
         self.ppd_kappa = self.config.ppd_args.kappa
         self.ppd_timestep_weighted = self.config.ppd_args.timestep_weighted
+        self.ppd_log_gradient_ratio = self.config.ppd_args.log_gradient_ratio
+        self.ppd_gradient_ratio_warn = self.config.ppd_args.gradient_ratio_warn
+        # DeepSpeed registers grad-accumulation post-backward hooks that fire
+        # (and crash) inside torch.autograd.grad, so the probe only runs on
+        # plain DDP. Calibrate rho with `config_file: null`; gradients are
+        # mathematically identical with and without ZeRO sharding.
+        if (
+            self.ppd_enabled
+            and self.ppd_log_gradient_ratio
+            and getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        ):
+            self.ppd_log_gradient_ratio = False
+            logger.warning(
+                "[ppd] gradient-ratio probe disabled under DeepSpeed; run the "
+                "calibration config without a deepspeed config_file to measure "
+                "ppd/grad_ratio"
+            )
         if self.ppd_enabled:
             if self.critique_enabled:
                 raise ValueError(
@@ -504,7 +525,33 @@ class DiffusionNFTTrainer(BaseTrainer):
                                 ),
                             )
                             ppd_weighted_rows = self.ppd_rho * ppd_rows
-                            loss = loss + ppd_weighted_rows.mean()
+                            ppd_aux_loss = ppd_weighted_rows.mean()
+
+                            # The gradient ratio is THE calibration metric: the
+                            # normalized NFT loss carries a large value with a
+                            # comparatively small gradient, so the loss-magnitude
+                            # ratio understates the auxiliary pull by orders of
+                            # magnitude. Probe once per batch (first timestep).
+                            if (
+                                self.ppd_log_gradient_ratio
+                                and self.ppd_rho > 0.0
+                                and t_idx == 0
+                            ):
+                                ppd_grad_ratio = gradient_norm_ratio(
+                                    ppd_aux_loss,
+                                    policy_loss,
+                                    self.adapter.get_trainable_parameters(),
+                                )
+                                loss_info['ppd/grad_ratio'].append(ppd_grad_ratio)
+                                if ppd_grad_ratio.item() > self.ppd_gradient_ratio_warn:
+                                    logger.warning(
+                                        "[ppd] gradient ratio %.4f exceeds the %.4f ceiling; "
+                                        "reduce ppd.rho",
+                                        ppd_grad_ratio.item(),
+                                        self.ppd_gradient_ratio_warn,
+                                    )
+
+                            loss = loss + ppd_aux_loss
 
                             with torch.no_grad():
                                 reduce_dims = tuple(range(1, old_v_pred.ndim))

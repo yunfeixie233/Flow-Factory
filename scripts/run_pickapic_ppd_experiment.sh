@@ -41,7 +41,7 @@ set -Eeuo pipefail
 #     WANDB_MODE=offline (the .env.example default) and sync later.
 #
 # USAGE
-#   ./run_pickapic_ppd_experiment.sh                   # auxiliary arm (rho=8)
+#   ./run_pickapic_ppd_experiment.sh                   # auxiliary arm (rho=0.02)
 #   PPD_ARM=control ./run_pickapic_ppd_experiment.sh   # matched rho=0 control
 #
 #   Environment overrides (all optional):
@@ -65,7 +65,8 @@ set -Eeuo pipefail
 #
 # HEALTHY FIRST-EPOCH METRICS (8xH100, measured 2026-07-16)
 #   ppd/data_coverage_rate = 1.0        ppd/data_active_rate ~ 0.87
-#   ppd/to_native_abs_loss ~ 0.0097 (aux; rho=8)   ppd/control_zero = 0 (control)
+#   ppd/grad_ratio ~ 0.01 at rho=0.02 (plain-DDP calibration probe only;
+#   under DeepSpeed the probe is off and ppd/to_native_abs_loss reads ~0.0000)
 #   train/policy_loss ~ 2.0             reward_mean (3-score sum) ~ 1.19 rising
 #
 # MONITORING

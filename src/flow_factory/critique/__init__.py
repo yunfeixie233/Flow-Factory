@@ -15,7 +15,11 @@
 """Standalone T2I critique/refinement component."""
 
 from .abc import BaseCritiqueBackend, CritiqueRequest, CritiqueResult
-from .loss import critique_direction_loss, ppd_same_state_distillation_loss
+from .loss import (
+    critique_direction_loss,
+    gradient_norm_ratio,
+    ppd_same_state_distillation_loss,
+)
 from .ppd import PPDProcessor, load_ppd_records
 from .processor import CritiqueProcessor
 from .registry import load_critique_backend
@@ -28,6 +32,7 @@ __all__ = [
     "CritiqueProcessor",
     "PPDProcessor",
     "critique_direction_loss",
+    "gradient_norm_ratio",
     "load_critique_backend",
     "load_ppd_records",
     "ppd_same_state_distillation_loss",

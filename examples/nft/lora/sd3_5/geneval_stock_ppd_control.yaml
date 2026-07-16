@@ -2,7 +2,7 @@
 # Identical to geneval_stock.yaml except for run identity and the ppd block:
 # It executes the exact PPD data/teacher/student plumbing with rho pinned to 0,
 # so its objective is exactly the stock baseline; ppd/control_zero must log 0.
-# Paired auxiliary arm: geneval_stock_ppd.yaml (rho: 100.0).
+# Paired auxiliary arm: geneval_stock_ppd.yaml (rho: 0.056).
 # Records staging: scripts/prepare_ppd_records.sh (after the runtime preparer).
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate

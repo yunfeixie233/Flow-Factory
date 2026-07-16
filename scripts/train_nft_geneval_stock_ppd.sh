@@ -22,7 +22,7 @@ set -Eeuo pipefail
 #   ./scripts/prepare_flowfactory_runtime.sh   # stage code/models/data on SSD
 #   ./scripts/check_flowfactory_runtime.sh     # verify the staged runtime
 #   ./scripts/prepare_ppd_records.sh           # stage PPD records on SSD
-#   ./scripts/train_nft_geneval_stock_ppd.sh   # auxiliary arm (rho=100)
+#   ./scripts/train_nft_geneval_stock_ppd.sh   # auxiliary arm (rho=0.056)
 #
 # The matched control arm differs only in rho and run identity:
 #   CONFIG=examples/nft/lora/sd3_5/geneval_stock_ppd_control.yaml \

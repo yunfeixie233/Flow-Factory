@@ -115,16 +115,18 @@ train:
   enable_gradient_checkpointing: false
   seed: 42
 
-# Privileged-prompt distillation. rho is calibrated so the auxiliary/native
-# loss ratio (ppd/to_native_abs_loss) lands near the ~1% AdvantageFlow
-# production target. This config's native NFT loss is ~2.2 (nft_beta=1.0);
-# AF-parity rho values are far too small in this trainer. Measured at this
-# geometry: rho=7 -> 0.85%, so rho=8 -> ~0.97% (the ratio is linear in rho). The teacher is the lagged EMA sampling policy
+# Privileged-prompt distillation. rho is calibrated on the auxiliary/native
+# GRADIENT-norm ratio (ppd/grad_ratio, probed on plain DDP), targeting the
+# ~1% AdvantageFlow production value. Do NOT calibrate on the loss-magnitude
+# ratio: rho=8 read a 1.0% loss ratio but a 389% gradient ratio, and the
+# training reward collapsed within five epochs (run jlwa2xfl). Measured at
+# this geometry: rho=8 -> grad ratio 3.89, so rho=0.02 -> ~0.97% (the ratio
+# is linear in rho). The teacher is the lagged EMA sampling policy
 # evaluated at the NFT training states under both conditionings.
 ppd:
   enabled: true
   records_path: "${RUNTIME_ROOT}/data/pickapic_balanced_v0_pairs/records.jsonl"
-  rho: 8.0
+  rho: 0.02
   kappa: 1.0
   timestep_weighted: true
   mask_identity: true

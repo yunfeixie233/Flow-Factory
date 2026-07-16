@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -61,6 +61,48 @@ def critique_direction_loss(
         * direction_mse
     )
     return rows, direction_mse
+
+
+def gradient_norm_ratio(
+    numerator_loss: torch.Tensor,
+    denominator_loss: torch.Tensor,
+    parameters: Sequence[torch.Tensor],
+    probe_scale: float = 16384.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Measure ``||d numerator/d params|| / ||d denominator/d params||``.
+
+    Both losses are scaled by ``probe_scale`` before differentiation so half
+    precision gradients do not underflow; the ratio is scale-invariant. The
+    computation uses ``torch.autograd.grad`` with ``retain_graph=True`` and
+    does not touch ``param.grad``, so the caller's subsequent backward pass
+    over the combined loss is unaffected.
+    """
+
+    parameters = [p for p in parameters if p.requires_grad]
+    if not parameters:
+        raise ValueError("gradient_norm_ratio requires at least one trainable parameter")
+
+    def _norm(loss: torch.Tensor) -> torch.Tensor:
+        grads = torch.autograd.grad(
+            loss * probe_scale,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        total = None
+        for grad in grads:
+            if grad is None:
+                continue
+            value = grad.float().square().sum()
+            total = value if total is None else total + value
+        if total is None:
+            return torch.zeros((), device=loss.device)
+        return total.sqrt()
+
+    numerator = _norm(numerator_loss)
+    denominator = _norm(denominator_loss)
+    return (numerator / (denominator + eps)).detach()
 
 
 def ppd_same_state_distillation_loss(

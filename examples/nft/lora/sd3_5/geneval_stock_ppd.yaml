@@ -99,17 +99,19 @@ train:
   # Seed
   seed: 42 # Random seed
 
-# Privileged-prompt distillation. rho is calibrated so the auxiliary/native
-# loss ratio (ppd/to_native_abs_loss) lands near the ~1% AdvantageFlow
-# production target. NFT's native loss scale (~24 here, from the /nft_beta and
-# adv-clip scaling) is ~1000x the AF flow-matching loss, so AF-parity rho
-# values are far too small in this trainer. Measured at this geometry:
-# rho=60 -> 0.56%, so rho=100 -> ~0.93% (the ratio is linear in rho). The teacher is the lagged EMA sampling policy evaluated at the
+# Privileged-prompt distillation. rho is calibrated on the auxiliary/native
+# GRADIENT-norm ratio (ppd/grad_ratio, probed on plain DDP), targeting the
+# ~1% AdvantageFlow production value. Do NOT calibrate on the loss-magnitude
+# ratio: the normalized NFT loss carries a large value with a small gradient,
+# so ppd/to_native_abs_loss understates the auxiliary pull ~1900x here
+# (rho=100 read 0.93% loss ratio but 1772% gradient ratio and collapsed
+# training). Measured at this geometry: rho=100 -> grad ratio 17.72, so
+# rho=0.056 -> ~0.99% (the ratio is linear in rho). The teacher is the lagged EMA sampling policy evaluated at the
 # NFT training states under both conditionings.
 ppd:
   enabled: true
   records_path: "${RUNTIME_ROOT}/data/geneval_stock_ppd_pairs/records.jsonl"
-  rho: 100.0
+  rho: 0.056
   kappa: 1.0
   timestep_weighted: true
   mask_identity: true

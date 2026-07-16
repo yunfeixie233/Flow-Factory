@@ -94,6 +94,22 @@ class PPDArguments(ArgABC):
         default="accelerator",
         metadata={"help": "Temporary device used to encode privileged prompts."},
     )
+    log_gradient_ratio: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Probe ||grad(aux)||/||grad(native)|| over the trainable parameters "
+                "on the first timestep of every optimize batch (ppd/grad_ratio). "
+                "This is the calibration metric: the loss-magnitude ratio "
+                "(ppd/to_native_abs_loss) severely underestimates the auxiliary "
+                "gradient's share for the normalized DiffusionNFT objective."
+            )
+        },
+    )
+    gradient_ratio_warn: float = field(
+        default=0.05,
+        metadata={"help": "Warn when the probed gradient ratio exceeds this ceiling."},
+    )
 
     def __post_init__(self) -> None:
         self.rho = float(self.rho)
@@ -104,3 +120,8 @@ class PPDArguments(ArgABC):
             raise ValueError(f"ppd.kappa must lie in [0, 1], got {self.kappa}")
         if self.enabled and not str(self.records_path):
             raise ValueError("ppd.records_path is required when PPD is enabled")
+        self.gradient_ratio_warn = float(self.gradient_ratio_warn)
+        if not math.isfinite(self.gradient_ratio_warn) or self.gradient_ratio_warn <= 0.0:
+            raise ValueError(
+                f"ppd.gradient_ratio_warn must be finite and positive, got {self.gradient_ratio_warn}"
+            )
