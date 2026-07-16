@@ -403,6 +403,11 @@ class CritiqueProcessor:
         """
 
         if not samples:
+            # Invariant: this early return is only distributed-safe when EVERY
+            # rank is empty (all skip the same later collectives together).
+            # Ranks with uneven emptiness would deadlock the round-2 reward
+            # wait/advantage gather below; valid rollout geometries always
+            # place at least one sample per rank.
             return {}
         if not all(self._is_t2i_sample(sample) for sample in samples):
             raise TypeError(

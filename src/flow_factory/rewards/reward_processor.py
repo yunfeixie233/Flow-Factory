@@ -349,6 +349,10 @@ class RewardProcessor:
             if not isinstance(metadata, str) or '"reward_prompt"' not in metadata:
                 return sample.prompt
             decoded = json.loads(metadata)
+            if "reward_prompt" not in decoded:
+                # The quoted key text only appeared inside another metadata
+                # value; there is no override, so keep the fast-path behavior.
+                return sample.prompt
             reward_prompt = decoded.get("reward_prompt")
 
         if not isinstance(reward_prompt, str) or not reward_prompt.strip():
