@@ -44,6 +44,8 @@ from ..utils.image import standardize_image_batch
 from ..utils.video import standardize_video_batch
 from ..utils.audio import standardize_audio_batch
 
+REWARD_METADATA_KEY = 'reward_metadata'
+
 # ============================ Reward Processor ============================
 class RewardProcessor:
     """
@@ -276,11 +278,59 @@ class RewardProcessor:
         sub_input = self._convert_media_format(sub_input, model)
         sub_input = move_tensors_to_device(sub_input, model.device)
         output = model(**sub_input)
+        if isinstance(output, RewardModelOutput):
+            self._store_row_aligned_metadata(name, sub_samples, output)
         sub_scores = torch.as_tensor(
             output.rewards if hasattr(output, 'rewards') else output,
             dtype=torch.float32,
         )
         return self._scatter_with_nan_padding(sub_scores, mask, reward_name=name)
+
+    @staticmethod
+    def _store_row_aligned_metadata(
+        reward_name: str,
+        samples: List[BaseSample],
+        output: RewardModelOutput,
+    ) -> None:
+        """Persist row-aligned reward metadata beside each scored sample.
+
+        Reward models may return batch-level diagnostics in ``extra_info``.
+        Values whose leading length matches the scored sub-batch are scattered
+        to ``sample.extra_kwargs['reward_metadata'][reward_name]``. Scalars and
+        other batch-global values remain out-of-band and are intentionally not
+        copied to every sample.
+        """
+        extra_info = getattr(output, 'extra_info', None)
+        if not isinstance(extra_info, dict) or not extra_info:
+            return
+
+        rows: List[Dict[str, Any]] = [{} for _ in samples]
+        for key, value in extra_info.items():
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 0 or value.shape[0] != len(samples):
+                    continue
+            elif isinstance(value, np.ndarray):
+                if value.ndim == 0 or value.shape[0] != len(samples):
+                    continue
+            elif isinstance(value, (list, tuple)):
+                if len(value) != len(samples):
+                    continue
+            else:
+                continue
+
+            for row, row_value in zip(rows, value):
+                row[key] = row_value
+
+        for sample, row in zip(samples, rows):
+            if not row:
+                continue
+            by_reward = sample.extra_kwargs.setdefault(REWARD_METADATA_KEY, {})
+            if not isinstance(by_reward, dict):
+                raise TypeError(
+                    f"sample.extra_kwargs[{REWARD_METADATA_KEY!r}] must be a dict, "
+                    f"got {type(by_reward).__name__}"
+                )
+            by_reward[reward_name] = row
 
     @staticmethod
     def _resolve_reward_prompt(sample: BaseSample) -> Optional[str]:

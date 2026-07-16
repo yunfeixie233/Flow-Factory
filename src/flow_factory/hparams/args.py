@@ -30,6 +30,7 @@ import yaml
 
 from .abc import ArgABC
 from .data_args import DataArguments
+from .critique_args import CritiqueArguments
 from .model_args import ModelArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import (
@@ -156,6 +157,10 @@ class Arguments(ArgABC):
     eval_reward_args: Optional[MultiRewardArguments] = field(
         default=None,
         metadata={"help": "Arguments for multiple evaluation reward configurations."},
+    )
+    critique_args: CritiqueArguments = field(
+        default_factory=CritiqueArguments,
+        metadata={"help": "Optional shared T2I critique/refinement configuration."},
     )
 
     def __post_init__(self):
@@ -1003,6 +1008,7 @@ class Arguments(ArgABC):
             'log': ('log_args', LogArguments),
             'rewards': ('reward_args', MultiRewardArguments),
             'eval_rewards': ('eval_reward_args', MultiRewardArguments),
+            'critique': ('critique_args', CritiqueArguments),
         }
 
         # 3. Build init kwargs

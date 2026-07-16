@@ -20,25 +20,27 @@ Reference:
     - https://arxiv.org/abs/2509.16117
 """
 import os
-from typing import List, Dict, Any, Union, Optional
-from functools import partial
 from collections import defaultdict
-from contextlib import nullcontext, contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import partial
+from typing import Any, Dict, List, Optional, Union
+
 import numpy as np
 import torch
-from diffusers.utils.torch_utils import randn_tensor
 import tqdm as tqdm_
+from diffusers.utils.torch_utils import randn_tensor
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from .abc import BaseTrainer
+from ..critique import critique_direction_loss
 from ..hparams import NFTTrainingArguments
-from ..samples import BaseSample
 from ..rewards import RewardBuffer
-from ..utils.base import filter_kwargs, create_generator_by_prompt, to_broadcast_tensor
+from ..samples import BaseSample
+from ..utils.base import create_generator, filter_kwargs, to_broadcast_tensor
+from ..utils.dist import reduce_loss_info
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler, flow_match_sigma
-from ..utils.dist import reduce_loss_info
+from .abc import BaseTrainer
 
 logger = setup_logger(__name__)
 
@@ -65,7 +67,8 @@ class DiffusionNFTTrainer(BaseTrainer):
         self.timestep_range = self.training_args.timestep_range
 
         self.kl_type = self.training_args.kl_type
-
+        self.critique_enabled = self.config.critique_args.enabled
+        self._critique_rollout_batch_index = 0
     @property
     def enable_kl_loss(self) -> bool:
         """Check if KL penalty is enabled."""
@@ -193,11 +196,44 @@ class DiffusionNFTTrainer(BaseTrainer):
     # =========================== Sampling Loop ============================
     def sample(self) -> List[BaseSample]:
         """Generate rollouts for DiffusionNFT (final latents only)."""
+        self._critique_rollout_batch_index = 0
         return self.generate_samples(
             reward_buffer=self.reward_buffer,
             compute_log_prob=False,
             trajectory_indices=[-1],
         )
+
+    def sample_batch(
+        self,
+        batch: Dict[str, Any],
+        reward_buffer: Optional[RewardBuffer] = None,
+        **extra_inference_kwargs,
+    ) -> List[BaseSample]:
+        """Record reproducible rollout-pack seeds when paired critique is enabled."""
+
+        paired_round1 = self.critique_enabled and "generator" not in extra_inference_kwargs
+        if paired_round1:
+            generator = create_generator(
+                self.training_args.seed,
+                self.epoch,
+                self.accelerator.process_index,
+                self._critique_rollout_batch_index,
+            )
+            extra_inference_kwargs["generator"] = generator
+
+        sample_batch = super().sample_batch(
+            batch,
+            reward_buffer=reward_buffer,
+            **extra_inference_kwargs,
+        )
+        if paired_round1:
+            batch_id = self._critique_rollout_batch_index
+            seed = generator.initial_seed()
+            for sample in sample_batch:
+                sample.extra_kwargs["critique_batch_id"] = batch_id
+                sample.extra_kwargs["critique_seed"] = seed
+            self._critique_rollout_batch_index += 1
+        return sample_batch
 
     # =========================== Optimization Loop ============================
     def _compute_nft_output(
@@ -242,6 +278,13 @@ class DiffusionNFTTrainer(BaseTrainer):
         rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
         self.compute_advantages(samples, rewards, store_to_samples=True)
         adv_metrics = self.advantage_processor.pop_advantage_metrics()
+        if self.critique_enabled:
+            if self.critique_processor is None:
+                raise RuntimeError("Critique is enabled but the shared processor was not initialized")
+            with self.sampling_context():
+                adv_metrics.update(
+                    self.critique_processor.refine(self, samples, rewards)
+                )
         if adv_metrics:
             self.log_data(adv_metrics, step=self.step)
 
@@ -275,7 +318,10 @@ class DiffusionNFTTrainer(BaseTrainer):
             ):
                 batch_size = batch['all_latents'].shape[0]
                 clean_latents = batch['all_latents'][:, -1]
-
+                critique = batch.get('critique') if self.critique_enabled else None
+                critique_clean_latents = (
+                    critique['clean_latents'] if critique is not None else None
+                )
                 # ---------- Per-batch precompute: old v predictions under sampling policy ----------
                 self.adapter.rollout()
                 with torch.no_grad(), self.autocast(), self.sampling_context():
@@ -350,6 +396,40 @@ class DiffusionNFTTrainer(BaseTrainer):
                         ori_policy_loss = (r.squeeze() * positive_loss + (1.0 - r.squeeze()) * negative_loss) / self.nft_beta
                         policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
                         loss = policy_loss
+
+                        # Optional auxiliary direction from the paired rewrite.
+                        # The native NFT term above remains load-bearing and owns
+                        # its old-policy anchor; critique adds no second anchor.
+                        if critique is not None:
+                            critique_noised_latents = (
+                                (1 - sigma_broadcast) * critique_clean_latents
+                                + sigma_broadcast * noise
+                            )
+                            critique_batch = {
+                                **batch,
+                                **critique['conditioning'],
+                            }
+                            with torch.no_grad(), self.autocast():
+                                rewrite_output = self._compute_nft_output(
+                                    critique_batch,
+                                    t_flat,
+                                    critique_noised_latents,
+                                )
+                            critique_rows, direction_mse = critique_direction_loss(
+                                student_velocity=new_v_pred,
+                                rewrite_velocity=rewrite_output['noise_pred'],
+                                advantage=critique['advantage'],
+                                sigma=flow_match_sigma(t_flat),
+                            )
+                            critique_loss = (
+                                self.training_args.critique_loss_weight
+                                * critique_rows.mean()
+                            )
+                            loss = loss + critique_loss
+                            loss_info['critique_direction_mse'].append(
+                                direction_mse.mean().detach()
+                            )
+                            loss_info['critique_loss'].append(critique_loss.detach())
 
                         # 4. KL penalty
                         if self.enable_kl_loss:

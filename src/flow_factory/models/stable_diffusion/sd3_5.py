@@ -28,7 +28,7 @@ from accelerate import Accelerator
 
 from ...hparams import *
 from ..abc import BaseAdapter
-from ...samples import BaseSample
+from ...samples import T2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
@@ -48,7 +48,7 @@ from ...utils.logger_utils import setup_logger
 logger = setup_logger(__name__)
 
 @dataclass
-class SD3_5Sample(BaseSample):
+class SD3_5Sample(T2ISample):
     # Class var
     _shared_fields: ClassVar[frozenset[str]] = frozenset({})
     # Obj var

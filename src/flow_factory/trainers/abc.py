@@ -40,6 +40,7 @@ from ..data_utils.loader import (
 )
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
+from ..critique import CritiqueProcessor
 from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample, StackedSampleBatch
 from ..utils.logger_utils import setup_logger
@@ -263,6 +264,14 @@ class BaseTrainer(ABC):
             sampler_type=self.config.data_args.sampler_type,
             verbose=self.log_args.verbose,
             source_id_to_name=self.config.data_args.source_id_to_name,
+        )
+
+        # The component is trainer-agnostic; concrete algorithms explicitly
+        # decide whether to request paired refinement and consume its outputs.
+        self.critique_processor = (
+            CritiqueProcessor(self.config.critique_args)
+            if self.config.critique_args.enabled
+            else None
         )
 
         return self.reward_models, self.eval_reward_models
@@ -1038,3 +1047,8 @@ class BaseTrainer(ABC):
         for buf in getattr(self, 'eval_dataset_reward_buffers', {}).values():
             if buf is not None:
                 buf.shutdown(wait=False, cancel_futures=True)
+
+        # Critique backend worker pool.
+        critique_processor = getattr(self, 'critique_processor', None)
+        if critique_processor is not None:
+            critique_processor.close(wait=False)

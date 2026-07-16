@@ -341,13 +341,19 @@ class GenEvalRewardModel(PointwiseRewardModel):
         mask = scores >= self._detection_threshold
         return bboxes[mask], labels[mask], scores[mask]
 
-    def _evaluate_single(
+    @staticmethod
+    def _count_clause(classname: str, expected_count: int) -> str:
+        if expected_count == 1:
+            return f"a {classname} present"
+        return f"{expected_count} {classname} present"
+
+    def _evaluate_single_with_report(
         self,
         image: Image.Image,
         include: List[Dict[str, Any]],
         exclude: Optional[List[Dict[str, Any]]] = None,
-    ) -> float:
-        """Evaluate a single image against its GenEval metadata.
+    ) -> Tuple[float, List[Tuple[str, float]], str]:
+        """Evaluate one image and retain clause-level detector feedback.
 
         Args:
             image: Generated PIL image.
@@ -355,22 +361,35 @@ class GenEvalRewardModel(PointwiseRewardModel):
             exclude: Optional list of objects that should not appear.
 
         Returns:
-            Reward score in [0, 1].
+            ``(scalar_reward, breakdown, reason)``. ``breakdown`` contains
+            ``(requirement_text, score)`` pairs for the critique scorecard.
+            Scalar reward computation intentionally matches the pre-scorecard
+            implementation exactly.
         """
         bboxes, labels, scores = self._detect_objects(image)
 
         sub_rewards: List[float] = []
+        breakdown: List[Tuple[str, float]] = []
+        reasons: List[str] = []
 
         for req in include:
             classname = req["class"]
-            expected_count = req.get("count", 1)
+            expected_count = int(req.get("count", 1))
             required_color = req.get("color", None)
             position_spec = req.get("position", None)
+            count_clause = self._count_clause(classname, expected_count)
 
             class_idx = self._name_to_idx.get(classname)
             if class_idx is None:
                 logger.warning(f"Unknown class '{classname}' in GenEval metadata.")
                 sub_rewards.append(0.0)
+                breakdown.append((count_clause, 0.0))
+                if required_color:
+                    breakdown.append((f"the {classname} is {required_color}", 0.0))
+                if position_spec:
+                    relation, _ = position_spec
+                    breakdown.append((f"the {classname} is {relation} the other object", 0.0))
+                reasons.append(f"unknown detector class {classname}")
                 continue
 
             # Find detections of this class
@@ -395,22 +414,40 @@ class GenEvalRewardModel(PointwiseRewardModel):
 
             # Count reward
             count_reward = max(0.0, 1.0 - abs(expected_count - found_count) / expected_count)
+            breakdown.append((count_clause, float(count_reward)))
+            if found_count != expected_count:
+                reasons.append(
+                    f"expected {classname}=={expected_count}, found {found_count}"
+                )
 
             if required_color and found_count > 0:
                 # Color reward: check how many detected objects match the color
                 colored_count = 0
+                predicted_colors: List[str] = []
                 for bbox in count_bboxes[:expected_count]:
                     predicted_color = self._classify_color(image, bbox, classname)
+                    predicted_colors.append(predicted_color)
                     if predicted_color == required_color:
                         colored_count += 1
                 color_reward = max(
                     0.0, 1.0 - abs(expected_count - colored_count) / expected_count
                 )
+                breakdown.append(
+                    (f"the {classname} is {required_color}", float(color_reward))
+                )
+                if colored_count != expected_count:
+                    observed = ", ".join(predicted_colors) or "none"
+                    reasons.append(
+                        f"expected {required_color} {classname}>={expected_count}, "
+                        f"found {colored_count}; detected colors: {observed}"
+                    )
                 sub_rewards.append(min(count_reward, color_reward))
 
             elif position_spec and found_count > 0:
                 # Position reward: check spatial relation
                 relation, ref_group_idx = position_spec
+                position_reward = 0.0
+                scalar_reward = 0.0
                 # Find the reference object (from a previous include entry)
                 if ref_group_idx < len(include):
                     ref_classname = include[ref_group_idx]["class"]
@@ -422,38 +459,87 @@ class GenEvalRewardModel(PointwiseRewardModel):
                             pos_satisfied = _check_position(
                                 ref_bboxes[0], count_bboxes[0], relation
                             )
-                            sub_rewards.append(
-                                count_reward if pos_satisfied else 0.0
-                            )
+                            position_reward = 1.0 if pos_satisfied else 0.0
+                            scalar_reward = count_reward if pos_satisfied else 0.0
+                            if not pos_satisfied:
+                                reasons.append(
+                                    f"expected {classname} {relation} {ref_classname}, "
+                                    "relation not detected"
+                                )
                         else:
-                            sub_rewards.append(0.0)
+                            reasons.append(
+                                f"no target for {classname} to be {relation}"
+                            )
                     else:
-                        sub_rewards.append(0.0)
+                        reasons.append(f"unknown detector class {ref_classname}")
                 else:
-                    sub_rewards.append(count_reward)
+                    # Preserve the existing scalar fallback for malformed
+                    # metadata while marking the relation itself as unmet.
+                    scalar_reward = count_reward
+                    reasons.append(
+                        f"invalid target group {ref_group_idx} for {classname} {relation}"
+                    )
+                breakdown.append(
+                    (f"the {classname} is {relation} the other object", position_reward)
+                )
+                sub_rewards.append(scalar_reward)
             else:
                 sub_rewards.append(count_reward)
+                if required_color:
+                    # The object was absent, so color could not be evaluated.
+                    breakdown.append((f"the {classname} is {required_color}", 0.0))
+                if position_spec:
+                    relation, _ = position_spec
+                    breakdown.append(
+                        (f"the {classname} is {relation} the other object", 0.0)
+                    )
 
         # Exclude penalties
         if exclude:
             for exc in exclude:
                 classname = exc["class"]
                 max_allowed = exc.get("count", 0)
+                threshold = int(exc.get("count", 1))
                 class_idx = self._name_to_idx.get(classname)
                 if class_idx is None:
+                    breakdown.append(
+                        (f"fewer than {threshold} instances of {classname} present", 0.0)
+                    )
+                    reasons.append(f"unknown detector class {classname}")
                     continue
                 class_mask = labels == class_idx
                 class_scores_exc = scores[class_mask]
                 found = int((class_scores_exc >= self._counting_threshold).sum())
+                exclusion_score = 1.0 if found < threshold else 0.0
+                breakdown.append(
+                    (
+                        f"fewer than {threshold} instances of {classname} present",
+                        exclusion_score,
+                    )
+                )
+                if found >= threshold:
+                    reasons.append(
+                        f"expected {classname}<{threshold}, found {found}"
+                    )
                 if found > max_allowed:
                     excess = found - max_allowed
                     penalty = max(0.0, 1.0 - excess / max(max_allowed, 1))
                     sub_rewards.append(penalty)
 
         if not sub_rewards:
-            return 0.0
+            return 0.0, breakdown, "\n".join(reasons)
 
-        return sum(sub_rewards) / len(sub_rewards)
+        return sum(sub_rewards) / len(sub_rewards), breakdown, "\n".join(reasons)
+
+    def _evaluate_single(
+        self,
+        image: Image.Image,
+        include: List[Dict[str, Any]],
+        exclude: Optional[List[Dict[str, Any]]] = None,
+    ) -> float:
+        """Evaluate a single image and return only its scalar reward."""
+        reward, _, _ = self._evaluate_single_with_report(image, include, exclude)
+        return reward
 
     @torch.no_grad()
     def __call__(
@@ -492,6 +578,8 @@ class GenEvalRewardModel(PointwiseRewardModel):
 
         batch_size = len(image)
         rewards = []
+        breakdowns: List[List[Tuple[str, float]]] = []
+        reasons: List[str] = []
         tags: Optional[List[str]] = None
 
         with torch.amp.autocast("cuda", enabled=False):
@@ -510,10 +598,14 @@ class GenEvalRewardModel(PointwiseRewardModel):
                     if tags is None:
                         tags = []
                     tags.append(tag)
-                reward = self._evaluate_single(image[i], inc, exc)
+                reward, breakdown, reason = self._evaluate_single_with_report(
+                    image[i], inc, exc
+                )
                 rewards.append(reward)
+                breakdowns.append(breakdown)
+                reasons.append(reason)
 
-        extra_info = {}
+        extra_info = {"breakdown": breakdowns, "reason": reasons}
         if tags is not None:
             extra_info["tags"] = tags
 

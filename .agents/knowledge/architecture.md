@@ -30,8 +30,9 @@
 |--------|-----------|-------------|
 | `hparams/` | (standalone) | Everything |
 | `models/abc.py` | `hparams`, `samples`, `ema`, `scheduler`, `utils` | All model adapters, `trainers/abc.py` |
-| `trainers/abc.py` | `hparams`, `models/abc.py`, `rewards/`, `advantage/`, `data_utils/`, `logger/` | All trainer subclasses |
+| `trainers/abc.py` | `hparams`, `models/abc.py`, `rewards/`, `advantage/`, `critique/`, `data_utils/`, `logger/` | All trainer subclasses |
 | `advantage/` | `hparams`, `rewards/`, `samples/` | `trainers/abc.py` |
+| `critique/` | `hparams`, `samples/`, `utils/` | `trainers/abc.py`, critique-capable trainers |
 | `rewards/abc.py` | `hparams` | All reward models, `trainers/abc.py` |
 | `data_utils/` | `hparams` | `trainers/abc.py` |
 | `scheduler/` | (standalone) | `models/abc.py` |
@@ -62,6 +63,8 @@ Stage 2: K-Repeat Sampling
 Stage 3: Trajectory Generation
   │  adapter.inference() — full multi-step SDE/ODE denoising
   │  Produces: generated images/videos + trajectory data (noises, log-probs)
+  │  Optional T2I critique refinement (currently consumed by NFT):
+  │  async backend rewrite → semantic guard → same-seed paired rollout
   ▼
 Stage 4: Reward Computation
   │  RewardProcessor dispatches to Pointwise or Groupwise models
@@ -85,14 +88,14 @@ Stage 6: Policy Optimization
 | Method | Stages |
 |--------|--------|
 | `sample()` | 2–3 (K-repeat batches + `adapter.inference` trajectories) |
-| `prepare_feedback()` | 4–5: reward buffer finalize, `AdvantageProcessor` |
+| `prepare_feedback()` | 4–5: reward buffer finalize, `AdvantageProcessor`; optional paired critique refinement |
 | `optimize()` | 6: `adapter.forward` and optimizer step (DPO: form chosen/rejected pairs at entry, then loss) |
 
 ---
 
 ## Registry System
 
-All three registries map string keys → lazy import paths. Resolution: registry lookup → fallback to direct Python path → dynamic import. See `trainers/registry.py`, `models/registry.py`, `rewards/registry.py` for implementation.
+Trainer, model, and reward registries map string keys → lazy import paths. The critique backend registry follows the same registered-name/direct-Python-path pattern. See `trainers/registry.py`, `models/registry.py`, `rewards/registry.py`, and `critique/registry.py`.
 
 ### Registered Components
 
@@ -191,6 +194,10 @@ Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSampl
 ### Advantage Computation
 `AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. All reward-based trainers delegate to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op — no reward/advantage stage).
 
+### T2I Critique Refinement
+
+`CritiqueProcessor` (`critique/processor.py`) is an optional algorithm-neutral service initialized by `BaseTrainer`. It owns the backend request/result contract, prompt recipes, semantic validation, temporary rewritten-prompt encoding, same-seed paired rollout, original-prompt round-2 reward, and group-normalized improvement advantage. It attaches a nested `sample.extra_kwargs["critique"]` pair; trainers explicitly opt into consuming it. DiffusionNFT is the first and currently only loss consumer.
+
 ### Configuration Hierarchy
 ```
 Arguments (top-level)
@@ -199,6 +206,7 @@ Arguments (top-level)
 ├── SchedulerArguments    # dynamics_type, timestep_range, num_inference_steps
 ├── DataArguments         # dataset, preprocessing, resolution, sampler_type
 ├── MultiRewardArguments  # reward_model configs (list of RewardArguments)
+├── CritiqueArguments     # optional shared T2I critique/refinement service
 ├── LogArguments          # logger type, verbose, project name
 └── EvaluationArguments   # evaluation settings
 ```

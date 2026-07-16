@@ -25,6 +25,7 @@ from .abc import (
     GroupwiseRewardModel,
 )
 from .reward_processor import (
+    REWARD_METADATA_KEY,
     RewardProcessor,
     RewardBuffer,
 )
@@ -38,6 +39,7 @@ __all__ = [
     'PointwiseRewardModel',
     'GroupwiseRewardModel',
     'RewardModelOutput',
+    'REWARD_METADATA_KEY',
     'RewardProcessor',
     'RewardBuffer',
     # Registry

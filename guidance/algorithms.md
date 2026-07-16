@@ -388,6 +388,63 @@ train:
 
 > **Tip**: The `piecewise_linear` schedule is recommended for DiffusionNFT. It starts with a lower decay rate to allow faster initial policy divergence and gradually increases the decay to stabilize later training. You can fine-tune this behavior with `flat_steps` and `ramp_rate`.
 
+### Optional T2I Critique Refinement
+
+DiffusionNFT can consume Flow-Factory's standalone `critique` component. The component itself is algorithm-neutral: it accepts generated T2I samples plus named reward axes, obtains replacement captions through a backend with a row-aligned asynchronous interface, validates the replacements, renders paired round-2 samples from the same per-batch random initialization, and evaluates round 2 against the **original** prompt. The resulting pair is attached to each sample for an algorithm-specific loss. At present, only DiffusionNFT consumes that pair; the losses of GRPO, DPPO, DPO, DGPO, AWM, CRD, and DiffusionOPD are unchanged.
+
+For a valid rewrite $c'$ and its same-seed clean latent $x'_0$, the critique advantage is
+
+$$
+A_{\text{crit}} = \operatorname{clip}\left(\frac{r_2 - \mu_1(\text{prompt})}{\sigma_1}, -1, 1\right),
+$$
+
+where $r_2$ is scored against the original prompt, $\mu_1(\text{prompt})$ is the group's round-1 reward mean, and $\sigma_1$ is the global round-1 reward standard deviation. Invalid/empty/unchanged rewrites fall back to the original prompt and receive $A_{\text{crit}}=0$.
+
+The native DiffusionNFT objective remains the primary loss. Critique adds only the auxiliary direction term
+
+$$
+L = L_{\text{NFT}} + \lambda A_{\text{crit}}\sigma_t^2
+\left\|v_\theta(x_t,c)-\operatorname{sg}\left[v_\theta(x'_t,c')\right]\right\|_2^2 + L_{\text{KL}},
+$$
+
+using the same training timestep and Gaussian noise for $x_t$ and $x'_t$. The rewrite target is the online current policy with stop-gradient; the auxiliary term does not add a second old-policy anchor. `critique_loss_weight` is $\lambda$ and defaults to `0.1`. The safe component default is `advantage_mode: nonnegative`. Set `signed` to reproduce the current AdvantageFlow recipe; because negative rows can reduce curvature, keep the auxiliary weight small.
+
+```yaml
+critique:
+  enabled: true
+  backend: openai-compatible       # Or module.path:CustomBackend
+  model: google/gemini-2.5-flash
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_KEY      # Read from the environment; never stored in config
+  mode: geneval_rewrite_antihal    # See recipe list below; detail_rewrite for preference/aesthetic rewards
+  prompts_yaml: null               # Optional hot-reloaded prompt-recipe overlay YAML
+  reward_name: geneval
+  validator: geneval               # Use none outside GenEval
+  advantage_mode: nonnegative      # nonnegative (safe default) or signed
+  advantage_clip_range: [-1.0, 1.0] # Lower bound is raised to 0 in nonnegative mode
+  num_workers: 8
+  image_format: jpeg
+
+train:
+  trainer_type: nft
+  critique_loss_weight: 0.1
+```
+
+**Prompt recipes.** Four built-in recipes ship with the component, ported verbatim from the validated AdvantageFlow critic prompts (their exact wording is load-bearing — add new recipe names for experiments instead of editing them):
+
+| `mode` | Use with | Behavior |
+|---|---|---|
+| `geneval_rewrite` | Compositional rewards (GenEval) | Copy the target prompt, make only failed requirements explicit, add nothing else. |
+| `geneval_rewrite_antihal` | Compositional rewards | `geneval_rewrite` + an anti-hallucination guard (never name objects the target did not ask for). The winning arm of the GenEval critique-prompt ablation. |
+| `geneval_rewrite_nocosmetic` | Compositional rewards | Additionally bans cosmetic edits (`a`/`an` → `one`, inserting `directly`/`exactly`) that empirically tied or reduced reward. |
+| `detail_rewrite` | Preference/aesthetic rewards (PickScore, HPS) | Keep the subject, add vivid photographic detail. |
+
+`prompts_yaml` points to an overlay file with schema `recipes.<name>.{system, user_builder}` (user builders: `geneval_rewrite`, `detail_rewrite`). The file is re-read on modification, so editing it changes a **live** run's next critique batch without a restart; a recipe named after a built-in mode overrides it.
+
+The built-in backend launches all API rows concurrently. Once the first rollout pack's replies are ready, its round-2 render can run while later API rows remain in flight. The current implementation begins this phase after round-1 reward finalization; it does not yet couple directly to `RewardBuffer` futures to overlap critique with round-1 sampling. Rewritten prompts require online text encoding, so preprocessed runs temporarily load the adapter's text encoders during paired refinement.
+
+For a complete runnable GenEval setup, see [`examples/nft/lora/sd3_5/geneval_critique.yaml`](../examples/nft/lora/sd3_5/geneval_critique.yaml).
+
 ## AWM: Advantage Weighted Matching
 
 This algorithm is introduced in [[10]](#ref10). **Advantage Weighted Matching** further aligns RL optimization with the flow-matching pretraining objective by weighting the standard velocity matching loss with per-sample advantages. This formulation incorporates reward-based guidance directly into the velocity matching loss, effectively aligning the optimization target with the original flow-matching objective.

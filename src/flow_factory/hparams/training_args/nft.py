@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Union, Tuple
+from typing import Any, Literal, Tuple, Union
 
 from ._base import TrainingArguments, _standardize_clip_range, _standardize_timestep_range
 
@@ -30,9 +30,11 @@ class NFTTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+    advantage_aggregation: Literal["sum", "gdpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."
+        },
     )
     # NFT core
     nft_beta: float = field(
@@ -43,14 +45,23 @@ class NFTTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether to use EMA parameters for sampling off-policy data."},
     )
+    critique_loss_weight: float = field(
+        default=0.1,
+        metadata={
+            "help": (
+                "Weight of the optional critique direction loss. Used only when "
+                "the top-level critique component is enabled."
+            )
+        },
+    )
 
     # Clipping / KL
     adv_clip_range: tuple[float, float] = field(
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages."},
     )
-    kl_type: Literal['v-based'] = field(
-        default='v-based',
+    kl_type: Literal["v-based"] = field(
+        default="v-based",
         metadata={"help": "Type of KL divergence. NFT defaults to 'v-based'."},
     )
     kl_beta: float = field(
@@ -65,10 +76,14 @@ class NFTTrainingArguments(TrainingArguments):
     # Timestep control
     num_train_timesteps: int = field(
         default=0,
-        metadata={"help": "Total number of training timesteps. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."},
+        metadata={
+            "help": "Total number of training timesteps. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."
+        },
     )
-    time_sampling_strategy: Literal['uniform', 'logit_normal', 'discrete', 'discrete_with_init', 'discrete_wo_init'] = field(
-        default='discrete',
+    time_sampling_strategy: Literal[
+        "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
+    ] = field(
+        default="discrete",
         metadata={"help": "Time sampling strategy for training."},
     )
     time_shift: float = field(
@@ -88,14 +103,19 @@ class NFTTrainingArguments(TrainingArguments):
 
         # Guard kl_beta against scientific-notation strings (e.g. "1e-3" from CLI overrides).
         self.kl_beta = float(self.kl_beta)
+        self.critique_loss_weight = float(self.critique_loss_weight)
+        if self.critique_loss_weight < 0:
+            raise ValueError("critique_loss_weight must be nonnegative")
 
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
 
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
-            self.num_train_timesteps = max(1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])))
+            self.num_train_timesteps = max(
+                1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0]))
+            )
 
-        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
-        if self.kl_type not in ['v-based']:
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        if self.kl_type not in ["v-based"]:
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based'].")
 
     def get_num_train_timesteps(self, args: Any) -> int:
