@@ -54,7 +54,53 @@ pickapic_destination="${RUNTIME_ROOT}/data/${PICKAPIC_REWRITE_DATASET_NAME}"
   die "staged Pick-a-Pic rewrite dataset not found: ${pickapic_destination}"
 [[ -f "${PICKAPIC_REWRITE_DATASET_SOURCE}/records.jsonl" ]] || \
   die "Pick-a-Pic pairs records not found: ${PICKAPIC_REWRITE_DATASET_SOURCE}/records.jsonl"
-install -m 644 "${PICKAPIC_REWRITE_DATASET_SOURCE}/records.jsonl" \
-  "${pickapic_destination}/records.jsonl"
+
+# The balanced_v0 pairs predate the PPD record schema: normalize to
+# schema_version 1 and recompute `changed` from the prompts, failing on any
+# disagreement with the source flag instead of staging inconsistent rows.
+"${CONDA_ENV}/bin/python" - \
+  "${PICKAPIC_REWRITE_DATASET_SOURCE}/records.jsonl" \
+  "${pickapic_destination}/records.jsonl" <<'PY'
+import json
+import os
+import sys
+
+source, destination = sys.argv[1:]
+rows = changed_rows = 0
+temporary = destination + ".tmp"
+with open(source, encoding="utf-8") as src, open(temporary, "w", encoding="utf-8") as dst:
+    for line_number, line in enumerate(src, start=1):
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        original = record["original_prompt"]
+        conditioning = record["conditioning_prompt"]
+        changed = conditioning != original
+        if bool(record.get("changed")) != changed:
+            raise SystemExit(
+                f"{source}:{line_number}: source changed flag disagrees with the prompts"
+            )
+        rows += 1
+        changed_rows += changed
+        dst.write(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "dataset_index": record["dataset_index"],
+                    "original_prompt": original,
+                    "conditioning_prompt": conditioning,
+                    "changed": changed,
+                    "source": record.get("arm", "pickscore_balanced_v0_pairs"),
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+os.replace(temporary, destination)
+print(
+    f"rows={rows} changed={changed_rows} ({100.0 * changed_rows / max(rows, 1):.2f}%)"
+)
+PY
 printf 'ready: Pick-a-Pic PPD records at %s\n' "${pickapic_destination}/records.jsonl"
 printf 'PPD records staged under %s/data\n' "${RUNTIME_ROOT}"
