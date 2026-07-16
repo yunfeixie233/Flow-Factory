@@ -13,53 +13,45 @@
 #   export MODEL_PATH="TIGER-Lab/RationalRewards-8B-Edit"
 #   ./scripts/start_vllm_rational_reward.sh --max-model-len 8192
 #
-# Optional environment variables:
-#   VLLM_BIN          vLLM entrypoint (default: vllm from PATH)
-#   PORT              listen port (default: 8000)
-#   HOST              bind address (default: 0.0.0.0)
-#   SERVED_MODEL_NAME   OpenAI "model" id. Defaults: RationalRewards-8B-T2I or RationalRewards-8B-Edit
-#                       (inferred from MODEL_PATH). Override if you use a custom --served-model-name; value must
-#                       match the YAML vlm_model (vlm) key.
-#   TENSOR_PARALLEL_SIZE  (default: 1)
-#   DATA_PARALLEL_SIZE    If unset: number of entries in CUDA_VISIBLE_DEVICES (comma-separated),
-#                           or 1 if CUDA_VISIBLE_DEVICES is unset. Set explicitly to override.
-#   GPU_MEMORY_UTILIZATION (default: 0.9)
+# Runtime settings are loaded from .env. Leave the served-model name empty to
+# infer it from RATIONAL_REWARD_MODEL_PATH; leave data parallelism empty to
+# infer it from CUDA_VISIBLE_DEVICES.
 #   Any extra arguments are forwarded to `vllm serve` (e.g. --max-model-len 8192).
 
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-TIGER-Lab/RationalRewards-8B-T2I}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/lib/load_env.sh"
+flowfactory_load_env "${FLOWFACTORY_ENV_FILE:-${REPO_ROOT}/.env}"
+flowfactory_require_env VLLM_BIN VLLM_HOST VLLM_PORT \
+  VLLM_GPU_MEMORY_UTILIZATION RATIONAL_REWARD_MODEL_PATH \
+  RATIONAL_REWARD_TENSOR_PARALLEL_SIZE
 
-if [[ -n "${SERVED_MODEL_NAME:-}" ]]; then
+SERVED_MODEL_NAME="${RATIONAL_REWARD_SERVED_MODEL_NAME}"
+if [[ -n "${SERVED_MODEL_NAME}" ]]; then
   :
-elif [[ "${MODEL_PATH}" == *"RationalRewards-8B-Edit"* ]]; then
+elif [[ "${RATIONAL_REWARD_MODEL_PATH}" == *"RationalRewards-8B-Edit"* ]]; then
   SERVED_MODEL_NAME="RationalRewards-8B-Edit"
 else
   SERVED_MODEL_NAME="RationalRewards-8B-T2I"
 fi
 
-VLLM_BIN="${VLLM_BIN:-vllm}"
-PORT="${PORT:-8000}"
-HOST="${HOST:-0.0.0.0}"
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
-
-case "${DATA_PARALLEL_SIZE-unset}" in
-  unset)
+DATA_PARALLEL_SIZE="${RATIONAL_REWARD_DATA_PARALLEL_SIZE}"
+if [[ -z "${DATA_PARALLEL_SIZE}" ]]; then
     if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
       DATA_PARALLEL_SIZE="$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F',' '{print NF}')"
     else
       DATA_PARALLEL_SIZE=1
     fi
-    ;;
-esac
+fi
 
-exec "${VLLM_BIN}" serve "${MODEL_PATH}" \
-  --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
+exec "${VLLM_BIN}" serve "${RATIONAL_REWARD_MODEL_PATH}" \
+  --tensor-parallel-size "${RATIONAL_REWARD_TENSOR_PARALLEL_SIZE}" \
   --data-parallel-size "${DATA_PARALLEL_SIZE}" \
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
-  --host "${HOST}" \
-  --port "${PORT}" \
+  --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
+  --host "${VLLM_HOST}" \
+  --port "${VLLM_PORT}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --trust-remote-code \
   "$@"

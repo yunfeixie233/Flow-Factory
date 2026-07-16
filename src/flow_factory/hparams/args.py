@@ -42,6 +42,7 @@ from .reward_args import RewardArguments, MultiRewardArguments
 from .log_args import LogArguments
 from ..utils.logger_utils import setup_logger
 from ..utils.dist import get_world_size
+from ..utils.yaml_config import load_yaml_config
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -1046,10 +1047,7 @@ class Arguments(ArgABC):
         Load Arguments from a YAML configuration file.
         Example: args = Arguments.load_from_yaml("config.yaml")
         """
-        with open(yaml_file, 'r', encoding='utf-8') as f:
-            args_dict = yaml.safe_load(f)
-
-        return cls.from_dict(args_dict)
+        return cls.from_dict(load_yaml_config(yaml_file))
 
     @staticmethod
     def _migrate_legacy_eval_datasets(args_dict: dict[str, Any]) -> dict[str, Any]:

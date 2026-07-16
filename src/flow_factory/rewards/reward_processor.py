@@ -17,10 +17,13 @@
 Unified Reward Processor for handling multiple reward models.
 """
 from __future__ import annotations
-from typing import Dict, Any, Optional, List, Tuple, Set, Union, Literal
+
+import json
 from collections import defaultdict
-from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, Future
+from contextlib import nullcontext
+from typing import Dict, Any, Optional, List, Tuple, Set, Union, Literal
+
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -268,6 +271,8 @@ class RewardProcessor:
             for k in filtered_fields
             if all(getattr(s, k) is not None for s in sub_samples)
         }
+        if "prompt" in sub_input:
+            sub_input["prompt"] = [self._resolve_reward_prompt(s) for s in sub_samples]
         sub_input = self._convert_media_format(sub_input, model)
         sub_input = move_tensors_to_device(sub_input, model.device)
         output = model(**sub_input)
@@ -276,6 +281,32 @@ class RewardProcessor:
             dtype=torch.float32,
         )
         return self._scatter_with_nan_padding(sub_scores, mask, reward_name=name)
+
+    @staticmethod
+    def _resolve_reward_prompt(sample: BaseSample) -> Optional[str]:
+        """Return a dataset-provided reward prompt or the conditioning prompt.
+
+        Rewrite datasets may generate media from ``sample.prompt`` while asking
+        every reward model to score the result against an original prompt stored
+        as ``reward_prompt`` in JSONL metadata. Datasets without that key retain
+        the existing behavior exactly.
+        """
+        direct_override = sample.extra_kwargs.get("reward_prompt")
+        if direct_override is not None:
+            reward_prompt = direct_override
+        else:
+            metadata = sample.extra_kwargs.get("metadata")
+            if not isinstance(metadata, str) or '"reward_prompt"' not in metadata:
+                return sample.prompt
+            decoded = json.loads(metadata)
+            reward_prompt = decoded.get("reward_prompt")
+
+        if not isinstance(reward_prompt, str) or not reward_prompt.strip():
+            raise ValueError(
+                "dataset reward_prompt must be a non-empty string when provided, "
+                f"got {reward_prompt!r}"
+            )
+        return reward_prompt
 
     def _compute_pointwise_batch(
         self, name: str, model: PointwiseRewardModel, batch_samples: List[BaseSample]

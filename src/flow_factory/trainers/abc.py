@@ -44,8 +44,27 @@ from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample, StackedSampleBatch
 from ..utils.logger_utils import setup_logger
 from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default, visit_tensor_leaves
+from ..utils.checkpoint_publish import (
+    publish_checkpoint_to_s3,
+    prune_checkpoint_directories,
+    write_checkpoint_complete_marker,
+)
 
 logger = setup_logger(__name__)
+
+
+class _TrainerProgress:
+    """Small Accelerate-checkpointable wrapper for Python loop counters."""
+
+    def __init__(self, trainer: "BaseTrainer"):
+        self.trainer = trainer
+
+    def state_dict(self) -> Dict[str, int]:
+        return {"epoch": self.trainer.epoch, "step": self.trainer.step}
+
+    def load_state_dict(self, state_dict: Dict[str, int]) -> None:
+        self.trainer.epoch = int(state_dict["epoch"])
+        self.trainer.step = int(state_dict["step"])
 
 
 def _record_stream_on_batch(value: Any, stream: "torch.cuda.Stream") -> None:
@@ -81,6 +100,8 @@ class BaseTrainer(ABC):
         self.adapter = adapter
         self.epoch = 0
         self.step = 0
+        self._progress = _TrainerProgress(self)
+        self.accelerator.register_for_checkpointing(self._progress)
 
         self._initialization()
         self.adapter.post_init()
@@ -891,6 +912,99 @@ class BaseTrainer(ABC):
             save_directory=save_directory,
             model_only=self.log_args.save_model_only,
         )
+
+        self.accelerator.wait_for_everyone()
+
+        checkpoint_s3_uri = os.environ.get(
+            "FLOWFACTORY_CHECKPOINT_S3_URI", ""
+        ).rstrip("/")
+        checkpoint_upload_tool = os.environ.get(
+            "FLOWFACTORY_CHECKPOINT_UPLOAD_TOOL", "s5cmd"
+        )
+        upload_concurrency_value = os.environ.get(
+            "FLOWFACTORY_CHECKPOINT_UPLOAD_CONCURRENCY", "32"
+        )
+        retention_value = os.environ.get(
+            "FLOWFACTORY_CHECKPOINT_RETENTION",
+            str(getattr(self.log_args, "checkpoint_retention", 0)),
+        )
+        try:
+            checkpoint_upload_concurrency = int(upload_concurrency_value)
+        except ValueError as exc:
+            raise ValueError(
+                "FLOWFACTORY_CHECKPOINT_UPLOAD_CONCURRENCY must be a positive integer, "
+                f"got {upload_concurrency_value!r}"
+            ) from exc
+        if checkpoint_upload_concurrency <= 0:
+            raise ValueError(
+                "FLOWFACTORY_CHECKPOINT_UPLOAD_CONCURRENCY must be positive, "
+                f"got {checkpoint_upload_concurrency}"
+            )
+        try:
+            checkpoint_retention = int(retention_value)
+        except ValueError as exc:
+            raise ValueError(
+                "FLOWFACTORY_CHECKPOINT_RETENTION must be a non-negative integer, "
+                f"got {retention_value!r}"
+            ) from exc
+        if checkpoint_retention < 0:
+            raise ValueError(
+                "FLOWFACTORY_CHECKPOINT_RETENTION must be non-negative, "
+                f"got {checkpoint_retention}"
+            )
+        publication_error: Optional[Exception] = None
+        if self.accelerator.is_main_process:
+            checkpoint_metadata = {
+                "epoch": self.epoch if epoch is None else epoch,
+                "step": self.step,
+            }
+            try:
+                # This marker is written only after every rank has finished its
+                # checkpoint shard. Filesystem publishers and recovery tools can
+                # therefore distinguish a completed local tree from a crash remnant.
+                write_checkpoint_complete_marker(
+                    save_directory,
+                    metadata=checkpoint_metadata,
+                )
+
+                if checkpoint_s3_uri:
+                    logger.info(
+                        f"Uploading completed checkpoint directly from local SSD "
+                        f"to {checkpoint_s3_uri} with {checkpoint_upload_tool}"
+                    )
+                    destination = publish_checkpoint_to_s3(
+                        save_directory,
+                        checkpoint_s3_uri,
+                        upload_tool=checkpoint_upload_tool,
+                        concurrency=checkpoint_upload_concurrency,
+                    )
+                    logger.info(f"Checkpoint upload complete: {destination}/_COMPLETE")
+
+                if checkpoint_retention > 0:
+                    local_root = os.path.dirname(save_directory)
+                    removed_local = prune_checkpoint_directories(
+                        local_root,
+                        checkpoint_retention,
+                    )
+                    for removed in removed_local:
+                        logger.info(f"Pruned old local checkpoint: {removed}")
+
+            except Exception as exc:  # Propagate failure to every distributed rank.
+                publication_error = exc
+
+        failed = torch.tensor(
+            [1 if publication_error is not None else 0],
+            device=self.accelerator.device,
+            dtype=torch.int32,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast(failed, src=0)
+        if failed.item():
+            if publication_error is not None:
+                raise RuntimeError(
+                    f"checkpoint publication or retention failed: {publication_error}"
+                ) from publication_error
+            raise RuntimeError("checkpoint publication or retention failed on rank 0")
 
         self.accelerator.wait_for_everyone()
 

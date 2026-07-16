@@ -127,6 +127,33 @@ pip install -e .[deepspeed]
 
 A CUDA training image (Python 3.12, **uv**-based install, PyTorch 2.8 + `cu129`, `deepspeed`, `wandb`, bundled `diffusers`) is defined under [`docker/docker-cuda/`](docker/docker-cuda/Dockerfile). See [`docker/README.md`](docker/README.md) for build and run instructions (including `linux/amd64` on Apple Silicon).
 
+For Pluto review nodes, use the standardized local-SSD workflow instead of
+running Python or training directly from Sensei FS:
+
+```bash
+# Once after allocating a blank node. Safe to rerun on the same node.
+./scripts/prepare_flowfactory_runtime.sh
+./scripts/check_flowfactory_runtime.sh
+
+# Run the maintained SD3.5 GenEval experiment.
+./scripts/train_nft_geneval_baseline.sh
+
+# Run the AdvantageFlow-aligned Pick-a-Pic baseline. After it stops, rerun
+# preparation and launch the controlled balanced-v0 rewrite treatment.
+./scripts/train_nft_pickapic_multi_reward.sh
+./scripts/prepare_flowfactory_runtime.sh
+./scripts/train_nft_pickapic_multi_reward_rewrite.sh
+
+# Run any other command with the same staged code, Python, and cache routing.
+./scripts/run_in_flowfactory_runtime.sh -- ff-train path/to/config.yaml
+```
+
+Preparation installs a pinned Miniforge and Python 3.12 environment directly
+on local SSD, stages software and model/data assets in parallel, and reuses
+readiness markers on subsequent calls. See
+[`Storage and Training Operations`](guidance/storage_and_training.md) for the
+node lifecycle, supported customization points, and durability requirements.
+
 ## Experiment Trackers
 
 To use [Weights & Biases](https://wandb.ai/site/) or [SwanLab](https://github.com/SwanHubX/SwanLab) to log experimental results, install extra dependencies via `pip install -e .[wandb]` or `pip install -e .[swanlab]`.
@@ -159,6 +186,7 @@ We provide a set of guidance documents to help you understand the framework and 
 
 | Document | Description |
 |---|---|
+| [Storage and Training Operations](guidance/storage_and_training.md) | Pluto storage placement, cold-node preparation, SD3.5 GenEval training, checkpoint publication, recovery, and cleanup |
 | [Workflow](guidance/workflow.md) | End-to-end training pipeline: the overall stages from data preprocessing to policy optimization |
 | [Algorithms](guidance/algorithms.md) | Supported RL algorithms (GRPO, GRPO-Guard, DPPO, DiffusionNFT, AWM, DPO, DGPO, CRD, DiffusionOPD) and their configurations |
 | [Rewards](guidance/rewards.md) | Reward model system: built-in models, custom rewards, and remote reward servers |

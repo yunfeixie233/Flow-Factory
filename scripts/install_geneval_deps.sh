@@ -12,7 +12,7 @@
 # Usage:
 #   bash scripts/install_geneval_deps.sh
 # ─────────────────────────────────────────────────────────────────────────────
-set -euo pipefail
+set -Eeuo pipefail
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -25,19 +25,24 @@ error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/lib/load_env.sh"
+flowfactory_load_env "${FLOWFACTORY_ENV_FILE:-${REPO_ROOT}/.env}"
+flowfactory_require_env CONDA_ENV CUDA_ROOT MMCV_WHEEL MAX_JOBS \
+    TORCH_CUDA_ARCH_LIST MMCV_WITH_OPS FORCE_CUDA GENEVAL_BUILD_DIR \
+    GENEVAL_MMCV_VERSION
 
-# Prefer uv for speed; fall back to pip
-if command -v uv &>/dev/null; then
-    PIP="uv pip"
-else
-    PIP="pip"
-fi
+PYTHON_BIN="${CONDA_ENV}/bin/python"
+PIP=("${PYTHON_BIN}" -m pip)
+[[ -x "${PYTHON_BIN}" ]] || {
+    error "Python not found: ${PYTHON_BIN}"
+    exit 1
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-flight checks
 # ─────────────────────────────────────────────────────────────────────────────
 
-PY_VERSION=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+PY_VERSION=$("${PYTHON_BIN}" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
 if [[ "$PY_VERSION" != "3.10" && "$PY_VERSION" != "3.12" ]]; then
     warn "Python ${PY_VERSION} detected. This script has only been tested with Python 3.10 and 3.12."
@@ -45,74 +50,76 @@ if [[ "$PY_VERSION" != "3.10" && "$PY_VERSION" != "3.12" ]]; then
     echo ""
 fi
 
-if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+if ! "${PYTHON_BIN}" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
     error "PyTorch with CUDA is required but not available."
     exit 1
 fi
 
-TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
-info "Python ${PY_VERSION}, PyTorch ${TORCH_VERSION}, installer: ${PIP}"
+TORCH_VERSION=$("${PYTHON_BIN}" -c "import torch; print(torch.__version__)")
+info "Python ${PY_VERSION}, PyTorch ${TORCH_VERSION}, installer: ${PIP[*]}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 1: Install mmengine
+# Step 1: Install the pinned Python reward dependencies
 # ─────────────────────────────────────────────────────────────────────────────
-info "Step 1/4: Installing mmengine..."
-$PIP install mmengine
+info "Step 1/3: Installing pinned GenEval Python dependencies..."
+"${PIP[@]}" install -r "${REPO_ROOT}/config/runtime/geneval-reward-requirements.txt"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 2: Compile mmcv with CUDA ops
 # ─────────────────────────────────────────────────────────────────────────────
-info "Step 2/4: Compiling mmcv with CUDA ops (5-10 minutes)..."
+info "Step 2/3: Installing mmcv with CUDA ops..."
 
-MMCV_BUILD_DIR="${REPO_ROOT}/.geneval_build"
+MMCV_BUILD_DIR="${GENEVAL_BUILD_DIR}"
 mkdir -p "${MMCV_BUILD_DIR}"
 
-if [ ! -d "${MMCV_BUILD_DIR}/mmcv" ]; then
-    git clone --depth 1 -b v2.1.0 https://github.com/open-mmlab/mmcv.git "${MMCV_BUILD_DIR}/mmcv"
+if [[ -f "${MMCV_WHEEL}" ]]; then
+    info "Installing prebuilt MMCV wheel: ${MMCV_WHEEL}"
+    "${PIP[@]}" install --no-deps "${MMCV_WHEEL}"
+else
+    if [ ! -d "${MMCV_BUILD_DIR}/mmcv" ]; then
+        git clone --depth 1 -b "v${GENEVAL_MMCV_VERSION}" \
+            https://github.com/open-mmlab/mmcv.git "${MMCV_BUILD_DIR}/mmcv"
+    fi
+    CPATH="${CUDA_ROOT}/targets/x86_64-linux/include" \
+    LIBRARY_PATH="${CUDA_ROOT}/targets/x86_64-linux/lib" \
+    CUDA_HOME="${CUDA_ROOT}" MMCV_WITH_OPS="${MMCV_WITH_OPS}" \
+    FORCE_CUDA="${FORCE_CUDA}" MAX_JOBS="${MAX_JOBS}" \
+    TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+        "${PIP[@]}" install "${MMCV_BUILD_DIR}/mmcv" --no-build-isolation
 fi
-
-export MMCV_WITH_OPS=1
-export FORCE_CUDA=1
-export MAX_JOBS=${MAX_JOBS:-$(nproc)}
-export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;8.6;8.9;9.0}"
 info "  TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}, MAX_JOBS=${MAX_JOBS}"
 
-$PIP install "${MMCV_BUILD_DIR}/mmcv" --no-build-isolation
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Install mmdetection
+# Step 3: Verification
 # ─────────────────────────────────────────────────────────────────────────────
-info "Step 3/4: Installing mmdetection..."
+info "Step 3/3: Installing mmdet and verifying installation..."
+"${PIP[@]}" install --no-deps \
+    -r "${REPO_ROOT}/config/runtime/geneval-mmdet-requirement.txt"
 
-if [ ! -d "${MMCV_BUILD_DIR}/mmdetection" ]; then
-    git clone --depth 1 -b v3.3.0 https://github.com/open-mmlab/mmdetection.git "${MMCV_BUILD_DIR}/mmdetection"
-fi
-
-$PIP install "${MMCV_BUILD_DIR}/mmdetection" --no-build-isolation
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 4: Install open_clip_torch
-# ─────────────────────────────────────────────────────────────────────────────
-info "Step 4/4: Installing open_clip_torch..."
-$PIP install open_clip_torch
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Verification
-# ─────────────────────────────────────────────────────────────────────────────
-info "Verifying installation..."
-
-python -c "
+if ! "${PYTHON_BIN}" - <<'PY'
 import mmcv, mmdet, mmengine, open_clip
+import torch
+from mmcv.ops import nms
+from mmdet.apis import inference_detector, init_detector  # noqa: F401
+
 print(f'  mmcv:      {mmcv.__version__}')
 print(f'  mmdet:     {mmdet.__version__}')
 print(f'  mmengine:  {mmengine.__version__}')
 print(f'  open_clip: {open_clip.__version__}')
-from mmcv.ops import nms
-print('  CUDA ops:  OK')
-" || {
+boxes = torch.tensor(
+    [[0.0, 0.0, 10.0, 10.0], [1.0, 1.0, 9.0, 9.0], [20.0, 20.0, 30.0, 30.0]],
+    device='cuda',
+)
+scores = torch.tensor([0.9, 0.8, 0.7], device='cuda')
+_, keep = nms(boxes, scores, 0.5)
+torch.cuda.synchronize()
+assert keep.cpu().tolist() == [0, 2], keep
+print(f'  CUDA ops:  OK on {torch.cuda.get_device_name()} sm{torch.cuda.get_device_capability()[0]}{torch.cuda.get_device_capability()[1]}')
+PY
+then
     error "Verification failed."
     exit 1
-}
+fi
 
 info ""
 info "GenEval dependencies installed successfully!"

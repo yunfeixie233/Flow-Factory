@@ -39,6 +39,7 @@ from ..utils.base import (
     standardize_image_batch,
 )
 from ..utils.logger_utils import setup_logger
+from .cache_fingerprint import dataset_source_fingerprint
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -581,6 +582,7 @@ class GeneralDataset(Dataset):
             Cache path with fingerprint of specified length
         """
         dataset_name = os.path.basename(dataset_dir)
+        source_fingerprint = dataset_source_fingerprint(dataset_dir, split)
         cutoff_str = str(max_dataset_size) if max_dataset_size else "full"
         funcs_hash = _compute_encode_funcs_hash(preprocess_func, digits=16)
         hashable_kwargs = _select_cache_relevant_kwargs(preprocess_func, preprocess_kwargs)
@@ -590,16 +592,17 @@ class GeneralDataset(Dataset):
         extra_hash = "|".join(extra_hash_strs) if extra_hash_strs else ""
 
         combined = (
-            f"{dataset_name}|{split}|{cutoff_str}|{funcs_hash}|{kwargs_hash}"
+            f"{dataset_name}|{source_fingerprint}|{split}|{cutoff_str}|"
+            f"{funcs_hash}|{kwargs_hash}"
             f"|{extra_hash}|fmtv{_PREPROCESS_FORMAT_VERSION}"
         )
         fingerprint = hashlib.md5(combined.encode()).hexdigest()[:min(digits, 32)]
 
         logger.debug(
-            "compute_cache_path: dataset=%s split=%s cutoff=%s funcs=%s kwargs=%s "
-            "extra=%s hashable_keys=%s -> %s",
-            dataset_name, split, cutoff_str, funcs_hash, kwargs_hash, extra_hash,
-            sorted(hashable_kwargs), fingerprint,
+            "compute_cache_path: dataset=%s source=%s split=%s cutoff=%s funcs=%s "
+            "kwargs=%s extra=%s hashable_keys=%s -> %s",
+            dataset_name, source_fingerprint, split, cutoff_str, funcs_hash,
+            kwargs_hash, extra_hash, sorted(hashable_kwargs), fingerprint,
         )
         return os.path.join(os.path.expanduser(cache_dir), fingerprint)
 

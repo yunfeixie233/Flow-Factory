@@ -59,6 +59,7 @@ See `.agents/knowledge/architecture.md` "Module Dependency Graph" for full detai
 
 | Document | Purpose |
 |----------|---------|
+| `guidance/storage_and_training.md` | Pluto storage ownership, SD3.5 GenEval node lifecycle, checkpoint durability, and production migration |
 | `guidance/workflow.md` | 6-stage training pipeline with code examples |
 | `guidance/algorithms.md` | All 9 algorithms (GRPO, GRPO-Guard, DPPO, DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD) deep dive |
 | `guidance/rewards.md` | Reward system design, custom model creation |

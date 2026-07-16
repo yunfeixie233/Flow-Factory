@@ -12,41 +12,35 @@
 # keep --max-model-len well above (image tokens + max_tokens). The reward defaults
 # to max_tokens=4096; 32768 model length is a safe starting point.
 #
-# Optional environment variables:
-#   VLLM_BIN               vLLM entrypoint (default: vllm from PATH)
-#   MODEL_PATH             HF id or local path (default: Qwen/Qwen-Image-Bench)
-#   SERVED_MODEL_NAME      OpenAI "model" id (default: Qwen-Image-Bench); must match YAML vlm_model
-#   PORT                   listen port (default: 8000)
-#   HOST                   bind address (default: 0.0.0.0)
-#   TENSOR_PARALLEL_SIZE   If unset: number of entries in CUDA_VISIBLE_DEVICES, else 1.
-#   GPU_MEMORY_UTILIZATION (default: 0.9)
+# Runtime settings are loaded from .env. QWEN_IMAGE_BENCH_TENSOR_PARALLEL_SIZE
+# may be left empty to infer it from CUDA_VISIBLE_DEVICES.
 #   Any extra arguments are forwarded to `vllm serve` (e.g. --max-model-len 32768).
 
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen-Image-Bench}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen-Image-Bench}"
-VLLM_BIN="${VLLM_BIN:-vllm}"
-PORT="${PORT:-8000}"
-HOST="${HOST:-0.0.0.0}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/lib/load_env.sh"
+flowfactory_load_env "${FLOWFACTORY_ENV_FILE:-${REPO_ROOT}/.env}"
+flowfactory_require_env VLLM_BIN VLLM_HOST VLLM_PORT \
+  VLLM_GPU_MEMORY_UTILIZATION QWEN_IMAGE_BENCH_MODEL_PATH \
+  QWEN_IMAGE_BENCH_SERVED_MODEL_NAME
 
-case "${TENSOR_PARALLEL_SIZE-unset}" in
-  unset)
+TENSOR_PARALLEL_SIZE="${QWEN_IMAGE_BENCH_TENSOR_PARALLEL_SIZE}"
+if [[ -z "${TENSOR_PARALLEL_SIZE}" ]]; then
     if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
       TENSOR_PARALLEL_SIZE="$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F',' '{print NF}')"
     else
       TENSOR_PARALLEL_SIZE=1
     fi
-    ;;
-esac
+fi
 
-exec "${VLLM_BIN}" serve "${MODEL_PATH}" \
+exec "${VLLM_BIN}" serve "${QWEN_IMAGE_BENCH_MODEL_PATH}" \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
-  --host "${HOST}" \
-  --port "${PORT}" \
-  --served-model-name "${SERVED_MODEL_NAME}" \
+  --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
+  --host "${VLLM_HOST}" \
+  --port "${VLLM_PORT}" \
+  --served-model-name "${QWEN_IMAGE_BENCH_SERVED_MODEL_NAME}" \
   --limit-mm-per-prompt '{"image": 1}' \
   --trust-remote-code \
   "$@"

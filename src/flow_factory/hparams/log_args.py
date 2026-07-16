@@ -52,12 +52,28 @@ class LogArguments(ArgABC):
         metadata={"help": "Whether to save the model only, or the complete training state (model and optimizer)."}
     )
 
+    checkpoint_retention: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of newest completed local checkpoints to keep. "
+                "0 disables automatic pruning."
+            )
+        },
+    )
+
     verbose: bool = field(
         default=True,
         metadata={"help": "Whether to print detailed progress during training."},
     )
 
     def __post_init__(self):
+
+        if self.checkpoint_retention < 0:
+            raise ValueError(
+                "checkpoint_retention must be non-negative, "
+                f"got {self.checkpoint_retention}"
+            )
 
         # Expand path to user's path
         self.save_dir = os.path.expanduser(self.save_dir)

@@ -20,9 +20,9 @@ import subprocess
 import argparse
 import logging
 import torch
-import yaml
 
 from .utils.env_utils import ENV_VAR_MAPPINGS, env_lookup
+from .utils.yaml_config import load_yaml_config
 
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
@@ -100,7 +100,7 @@ def parse_args():
 def train_cli():
     # 1. Parse known args and keep the rest in 'unknown'
     args, unknown = parse_args()
-    config = yaml.safe_load(open(args.config, 'r'))
+    config = load_yaml_config(args.config)
     config_file = config.get('config_file')
 
     # 2. Three-layer config merging: YAML (baseline) -> ENV (auto-detect) -> CLI (highest priority)
@@ -142,7 +142,16 @@ def train_cli():
     # 3. Build the arguments for the training script
     script_args = [args.config] + unknown
 
-    if os.environ.get("RANK") is not None or num_procs <= 1:
+    # Pluto injects RANK=0/WORLD_SIZE=1 even when it has not launched a
+    # distributed worker group.  A real torchrun/Accelerate child also has
+    # LOCAL_RANK, so require both markers before bypassing our configured
+    # Accelerate launch.
+    already_distributed = (
+        os.environ.get("RANK") is not None
+        and os.environ.get("LOCAL_RANK") is not None
+    )
+    child_env = None
+    if already_distributed or num_procs <= 1:
         # Already launched by an external launcher (e.g. torchrun), or single-process mode
         cmd = [sys.executable, "-m", "flow_factory.train", *script_args]
         logger.info(f"Direct launch: {' '.join(cmd)}")
@@ -175,6 +184,13 @@ def train_cli():
 
         cmd.extend(["-m", "flow_factory.train", *script_args])
 
+        # Do not leak Pluto's singleton torch-distributed metadata into
+        # Accelerate. Accelerate will create the correct per-rank values for
+        # the requested worker group.
+        child_env = os.environ.copy()
+        for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
+            child_env.pop(name, None)
+
         logger.info("=" * 60)
         logger.info("Flow-Factory Launch Configuration")
         logger.info(f"  Num machines:       {num_machines}")
@@ -186,7 +202,7 @@ def train_cli():
         logger.info("=" * 60)
 
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=child_env)
     except subprocess.CalledProcessError as e:
         if e.returncode in (-signal.SIGINT, 128 + signal.SIGINT):
             logger.info("Training interrupted.")
