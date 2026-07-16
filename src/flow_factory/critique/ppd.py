@@ -204,9 +204,6 @@ class PPDProcessor:
             Globally reduced data-level PPD metrics.
         """
 
-        if not samples:
-            return {}
-
         privileged: List[str] = []
         active_rows: List[float] = []
         covered_rows: List[float] = []
@@ -216,20 +213,23 @@ class PPDProcessor:
             active_rows.append(float(active))
             covered_rows.append(float(covered))
 
-        manage_text_encoders = trainer.config.data_args.enable_preprocess
-        if manage_text_encoders:
-            encode_device = (
-                trainer.accelerator.device
-                if self.config.prompt_encoding_device == "accelerator"
-                else torch.device("cpu")
-            )
-            trainer.adapter.on_load_text_encoders(encode_device)
-        try:
-            with torch.no_grad():
-                conditioning = self._encode_privileged(trainer, privileged, samples)
-        finally:
+        # An empty local sample list still participates in the metric reduce
+        # below: every rank must join the collective or the others deadlock.
+        if samples:
+            manage_text_encoders = trainer.config.data_args.enable_preprocess
             if manage_text_encoders:
-                trainer.adapter.off_load_text_encoders()
+                encode_device = (
+                    trainer.accelerator.device
+                    if self.config.prompt_encoding_device == "accelerator"
+                    else torch.device("cpu")
+                )
+                trainer.adapter.on_load_text_encoders(encode_device)
+            try:
+                with torch.no_grad():
+                    conditioning = self._encode_privileged(trainer, privileged, samples)
+            finally:
+                if manage_text_encoders:
+                    trainer.adapter.off_load_text_encoders()
 
         for index, sample in enumerate(samples):
             target_device = sample.all_latents.device if sample.all_latents is not None else None
