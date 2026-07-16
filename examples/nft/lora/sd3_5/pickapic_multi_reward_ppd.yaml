@@ -117,14 +117,14 @@ train:
 
 # Privileged-prompt distillation. rho is calibrated so the auxiliary/native
 # loss ratio (ppd/to_native_abs_loss) lands near the ~1% AdvantageFlow
-# production target. This config's native NFT loss is ~2.2 (nft_beta=1.0), so
-# rho=7 measures ~1% at smoke geometry; AF-parity rho values are far too
-# small in this trainer. The teacher is the lagged EMA sampling policy
+# production target. This config's native NFT loss is ~2.2 (nft_beta=1.0);
+# AF-parity rho values are far too small in this trainer. Measured at this
+# geometry: rho=7 -> 0.85%, so rho=8 -> ~0.97% (the ratio is linear in rho). The teacher is the lagged EMA sampling policy
 # evaluated at the NFT training states under both conditionings.
 ppd:
   enabled: true
   records_path: "${RUNTIME_ROOT}/data/pickapic_balanced_v0_pairs/records.jsonl"
-  rho: 7.0
+  rho: 8.0
   kappa: 1.0
   timestep_weighted: true
   mask_identity: true

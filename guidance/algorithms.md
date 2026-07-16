@@ -461,7 +461,7 @@ where $m$ is the identity mask (rows whose privileged prompt equals the original
 ppd:
   enabled: true
   records_path: "${RUNTIME_ROOT}/data/geneval_stock_ppd_pairs/records.jsonl"
-  rho: 60.0          # 0.0 = matched control; see the calibration note below
+  rho: 100.0         # 0.0 = matched control; see the calibration note below
   kappa: 1.0
   timestep_weighted: true   # multiply rows by sigma_t^2
   mask_identity: true       # unchanged privileged prompts are inactive
@@ -472,7 +472,7 @@ train:
   off_policy: true          # required: the EMA sampling policy is the teacher
 ```
 
-**Calibrating `rho`.** The calibration metric is `ppd/to_native_abs_loss`, the auxiliary/native loss-magnitude ratio, targeted at roughly 1% (the AdvantageFlow production target; AF measured a gradient ratio, which does not port cleanly under ZeRO, so Flow-Factory uses the loss ratio as its proxy). Do **not** copy `rho` values across trainers: the ratio depends on the native loss scale, and DiffusionNFT's policy loss (`/nft_beta`, `* adv_clip`) is orders of magnitude larger than AF's flow-matching loss. Measured at smoke geometry, the stock-GenEval config (native ~24, `nft_beta=0.1`) needs `rho ~ 60` and the Pick-a-Pic three-reward config (native ~2.2, `nft_beta=1.0`) needs `rho ~ 7` for ~1%. The ratio is linear in `rho`: run one short epoch, read `ppd/to_native_abs_loss`, and scale.
+**Calibrating `rho`.** The calibration metric is `ppd/to_native_abs_loss`, the auxiliary/native loss-magnitude ratio, targeted at roughly 1% (the AdvantageFlow production target; AF measured a gradient ratio, which does not port cleanly under ZeRO, so Flow-Factory uses the loss ratio as its proxy). Do **not** copy `rho` values across trainers: the ratio depends on the native loss scale, and DiffusionNFT's policy loss (`/nft_beta`, `* adv_clip`) is orders of magnitude larger than AF's flow-matching loss. Measured at production geometry (step-0 epoch): the stock-GenEval config (native ~24, `nft_beta=0.1`) reads 0.56% at `rho=60`, so the shipped `rho: 100.0` lands ~0.93%; the Pick-a-Pic three-reward config (native ~2.2, `nft_beta=1.0`) reads 0.85% at `rho=7`, so the shipped `rho: 8.0` lands ~0.97%. The ratio is linear in `rho`: run one short epoch, read `ppd/to_native_abs_loss`, and scale.
 
 **Correctness metrics.** `ppd/control_zero` must be exactly `0` on every step of a `rho: 0.0` control run (objective purity). `ppd/data_coverage_rate` and `ppd/data_active_rate` report records coverage and changed-row share; `ppd/teacher_delta_rms` and `ppd/target_displacement_rms` bound how far the privileged conditioning moves the teacher target. Records for the stock GenEval and Pick-a-Pic baselines are staged with `scripts/prepare_ppd_records.sh`.
 

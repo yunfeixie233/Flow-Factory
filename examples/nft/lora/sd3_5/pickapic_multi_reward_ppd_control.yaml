@@ -20,7 +20,7 @@
 # AdvantageFlow paper-aligned DiffusionNFT multi-reward baseline + PPD matched control arm (rho=0). Identical to pickapic_multi_reward.yaml except for
 # run identity and the ppd block: It executes the exact PPD data/teacher/student plumbing with rho pinned
 # to 0, so its objective is exactly the multi-reward baseline; ppd/control_zero must log 0.
-# Paired auxiliary arm: pickapic_multi_reward_ppd.yaml (rho: 7.0).
+# Paired auxiliary arm: pickapic_multi_reward_ppd.yaml (rho: 8.0).
 # Records staging: scripts/prepare_ppd_records.sh (after the runtime preparer).
 
 launcher: "accelerate"
